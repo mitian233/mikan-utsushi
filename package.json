@@ -1,0 +1,19 @@
+{
+  "name": "mikan-utsushi",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.3.4",
+  "scripts": {
+    "dev": "pnpm --filter @mikan-utsushi/worker dev",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "test:watch": "pnpm --filter @mikan-utsushi/qqbot test -- --watch"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.0",
+    "@cloudflare/workers-types": "^4.20260901.0",
+    "typescript": "^6.0.0",
+    "vitest": "^4.0.0",
+    "wrangler": "^4.0.0"
+  }
+}

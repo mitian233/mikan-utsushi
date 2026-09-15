@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mikan-utsushi",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-15",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "GROUP_CHAT_AGENT",
+        "class_name": "GroupChatAgent"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["GroupChatAgent"]
+    }
+  ],
+  "vars": {
+    "QQ_API_BASE": "https://api.sgroup.qq.com",
+    "QQ_TOKEN_URL": "https://bots.qq.com/app/getAppAccessToken"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

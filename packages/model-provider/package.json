@@ -1,0 +1,15 @@
+{
+  "name": "@mikan-utsushi/model-provider",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@mikan-utsushi/contracts": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

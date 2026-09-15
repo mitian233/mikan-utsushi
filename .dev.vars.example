@@ -1,0 +1,7 @@
+# QQ Bot official credentials. Keep real values in .dev.vars or Wrangler secrets.
+QQ_APP_ID=
+QQ_APP_SECRET=
+
+# Optional overrides for local tests or a compatible gateway.
+QQ_API_BASE=https://api.sgroup.qq.com
+QQ_TOKEN_URL=https://bots.qq.com/app/getAppAccessToken

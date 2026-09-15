@@ -4,22 +4,26 @@
 
 **Goal:** Build a runnable Cloudflare-hosted QQ group and C2C companion with durable batching, an OpenAI-compatible tool loop, vision, explicit memory, Exa search, restricted webpage reading, and plain-text QQ replies.
 
-**Architecture:** The Worker verifies and normalizes QQ callbacks, then routes each stable QQ conversation to one SQLite-backed Cloudflare Agent. The Agent fixes two-second message batches, serializes turns through its FIFO queue, and runs a direct Chat Completions tool loop whose only external side effects are implemented by runtime-owned tools.
+**Architecture:** The Worker verifies and normalizes QQ callbacks, then routes each stable QQ conversation to one SQLite-backed Cloudflare Agent. The Agent fixes two-second message batches, serializes turns through its FIFO queue, and runs an OpenAI-compatible Chat Completions tool loop behind a runtime-owned adapter whose only external side effects are implemented by runtime-owned tools.
 
-**Tech Stack:** TypeScript 6, pnpm workspace, Cloudflare Workers, Cloudflare Agents, SQLite-backed Durable Objects, Vitest with the Cloudflare Workers pool, QQ Bot HTTP API, OpenAI-compatible Chat Completions, Exa REST Search API, Worker `fetch`, and `HTMLRewriter`.
+**Tech Stack:** TypeScript 6, pnpm workspace, Cloudflare Workers with current Node.js compatibility, Cloudflare Agents, SQLite-backed Durable Objects, Vitest with the Cloudflare Workers pool, QQ Bot HTTP API, the official OpenAI JavaScript SDK behind an OpenAI-compatible adapter, Exa REST Search API, Worker `fetch`, and `HTMLRewriter`.
 
 **Spec:** `docs/superpowers/specs/2026-09-15-qq-companion-runtime-design.md`
+
+**Compatibility note:** The selective SDK policy in this plan and `docs/architecture.md` supersedes the referenced specification only for the official OpenAI JavaScript SDK. The Exa SDK exclusion and all product, protocol, delivery, and security boundaries in the specification remain unchanged.
 
 ## Global Constraints
 
 - One deployment hosts one QQ bot; Agent IDs are exactly `qq:group:{group_openid}` and `qq:c2c:{user_openid}`.
-- Support only OpenAI-compatible Chat Completions with `tools` and `tool_calls`; do not add provider SDKs or other model protocols.
+- Support only OpenAI-compatible Chat Completions with `tools` and `tool_calls`; the official OpenAI JavaScript SDK is the only approved provider SDK and must remain behind the project-owned adapter. Do not add other model protocols.
 - Treat `LLM_CHAT_COMPLETIONS_URL` as a complete URL and send the API key as a Bearer token.
+- Keep a compatibility date on or after `2026-08-04`, which enables Workers Node.js compatibility by default. Do not treat this as a complete Node.js runtime: every imported SDK path must pass the Workers test pool, and the integrated application must pass the production bundle check before final acceptance.
 - Keep the fixed batch window at two seconds and the full turn deadline at 120 seconds.
 - Do not impose a tool-call-count limit; a turn ends when the model returns no tool calls.
 - Only `send_message` may emit QQ output; plain assistant content has no external effect.
 - Keep Memory private to one Agent and never link group and C2C identities.
-- Use Exa only for `search_web`; implement `read_web` with restricted direct Worker fetch.
+- Use Exa only for `search_web` and keep its client on direct Worker `fetch` until the Exa SDK provides verified abort and timeout propagation. Implement `read_web` permanently with restricted direct Worker `fetch`.
+- Do not integrate the full `@tencent-connect/qqbot-nodejs` runtime. A future isolated evaluation may test only its REST/protocol entrypoint, but `QQBotClient`, delivery idempotency, and unknown-outcome handling remain project-owned unless that evaluation proves identical behavior in Workers.
 - Keep outbound messages plain text; no image, audio, video, file, Markdown-template, CLI, browser, login, or write-capable web tools.
 - Keep persona and conversational behavior in `apps/worker/src/prompts/system-prompt.md`; enforce security and delivery rules in code.
 - Do not add a dashboard, online settings API, D1, R2, Workers Queues, vector database, or background summarizer.
@@ -56,8 +60,9 @@ packages/contracts/src/index.ts      shared message, model, tool, and outcome ty
 
 packages/model-provider/src/
   index.ts                           public exports
-  openai-compatible.ts               direct Chat Completions client
+  openai-compatible.ts               SDK-backed compatible adapter with direct fallback
   openai-compatible.test.ts
+packages/model-provider/vitest.config.ts  Workers-runtime provider tests
 
 packages/qqbot/src/
   normalize.ts                       group/C2C text, image, and reply normalization
@@ -75,7 +80,7 @@ packages/web-tools/src/
   limited-fetch.ts                   timeout, redirects, MIME, and byte limit
   limited-fetch.test.ts
   html-to-text.ts                    HTMLRewriter extraction and truncation
-  exa-search.ts                      direct Exa REST client
+  exa-search.ts                      direct Exa REST client with abort propagation
   exa-search.test.ts
 packages/web-tools/vitest.config.ts  Workers-runtime package tests
 ```
@@ -89,6 +94,7 @@ Tasks 7, 8, and 9 have separate file ownership and may run in parallel after Tas
 **Files:**
 - Modify: `package.json`
 - Modify: `apps/worker/package.json`
+- Modify: `packages/model-provider/package.json`
 - Modify: `packages/web-tools/package.json`
 - Modify: `apps/worker/wrangler.jsonc`
 - Modify: `apps/worker/tsconfig.json`
@@ -98,6 +104,7 @@ Tasks 7, 8, and 9 have separate file ownership and may run in parallel after Tas
 - Create: `apps/worker/src/prompts/index.ts`
 - Create: `apps/worker/src/types/text-modules.d.ts`
 - Create: `apps/worker/vitest.config.ts`
+- Create: `packages/model-provider/vitest.config.ts`
 - Create: `packages/web-tools/vitest.config.ts`
 - Create: `apps/worker/worker-configuration.d.ts`
 - Modify: `.dev.vars.example`
@@ -114,10 +121,11 @@ Run only after explicit approval:
 ```bash
 pnpm install
 pnpm --filter @mikan-utsushi/worker add -E agents@latest
+pnpm --filter @mikan-utsushi/model-provider add -E openai@latest
 pnpm --filter @mikan-utsushi/web-tools add -E ipaddr.js@latest
 ```
 
-Expected: `pnpm-lock.yaml` is created, `agents` and `ipaddr.js` are exact versions in their owning package manifests, and no real credentials are written.
+Expected: `pnpm-lock.yaml` is created, `agents`, `openai`, and `ipaddr.js` are exact versions in their owning package manifests, and no real credentials are written.
 
 - [ ] **Step 2: Write failing environment parser tests**
 
@@ -188,7 +196,7 @@ declare module "*.md" {
 }
 ```
 
-Write `system-prompt.md` with the QQ companion identity, instructions to use tools when needed, permission to remain silent, and guidance to avoid fragmented multi-message replies except when the conversation naturally benefits from them. Configure both Vitest files with `defineWorkersConfig`; the web-tools configuration supplies a Workers runtime so `HTMLRewriter` tests do not run in Node.
+Write `system-prompt.md` with the QQ companion identity, instructions to use tools when needed, permission to remain silent, and guidance to avoid fragmented multi-message replies except when the conversation naturally benefits from them. Configure all three Vitest files with `defineWorkersConfig`; the model-provider and web-tools configurations supply a Workers runtime so SDK compatibility and `HTMLRewriter` tests do not run only in Node.
 
 Export the bundled value through:
 
@@ -213,7 +221,7 @@ Expected: all commands succeed and the imported Markdown value type-checks as `s
 - [ ] **Step 7: Commit after explicit approval**
 
 ```bash
-git add package.json apps/worker/package.json packages/web-tools/package.json pnpm-lock.yaml apps/worker/wrangler.jsonc apps/worker/tsconfig.json apps/worker/worker-configuration.d.ts apps/worker/src/env.ts apps/worker/src/env.test.ts apps/worker/src/prompts/system-prompt.md apps/worker/src/prompts/index.ts apps/worker/src/types/text-modules.d.ts apps/worker/vitest.config.ts packages/web-tools/vitest.config.ts .dev.vars.example
+git add package.json apps/worker/package.json packages/model-provider/package.json packages/web-tools/package.json pnpm-lock.yaml apps/worker/wrangler.jsonc apps/worker/tsconfig.json apps/worker/worker-configuration.d.ts apps/worker/src/env.ts apps/worker/src/env.test.ts apps/worker/src/prompts/system-prompt.md apps/worker/src/prompts/index.ts apps/worker/src/types/text-modules.d.ts apps/worker/vitest.config.ts packages/model-provider/vitest.config.ts packages/web-tools/vitest.config.ts .dev.vars.example
 git commit -m "chore: configure the QQ companion runtime
 
 Co-Authored-By: openai-code-agent[bot] <242516109+Codex@users.noreply.github.com>"
@@ -312,7 +320,7 @@ git commit -m "feat: normalize QQ group and direct messages
 Co-Authored-By: openai-code-agent[bot] <242516109+Codex@users.noreply.github.com>"
 ```
 
-### Task 3: OpenAI-compatible Chat Completions client
+### Task 3: OpenAI-compatible Chat Completions adapter
 
 **Files:**
 - Modify: `packages/model-provider/src/index.ts`
@@ -326,7 +334,7 @@ Co-Authored-By: openai-code-agent[bot] <242516109+Codex@users.noreply.github.com
 
 - [ ] **Step 1: Write failing protocol tests**
 
-Assert an injected `fetchFn` receives the exact configured URL and body:
+Assert the adapter's injected `fetchFn` receives the exact configured URL and body regardless of whether the official SDK or the direct fallback sends the request:
 
 ```ts
 expect(request.url).toBe("https://gateway.example/custom/chat");
@@ -338,7 +346,7 @@ expect(await request.json()).toEqual({
 });
 ```
 
-Test plain assistant content, multiple `tool_calls`, malformed JSON arguments preserved as a validation error, non-2xx responses, invalid response shape, and abort propagation.
+Test plain assistant content, multiple `tool_calls`, malformed JSON arguments preserved as a validation error, non-2xx responses, invalid response shape, abort propagation, and a non-standard complete endpoint URL that cannot be represented as an OpenAI SDK `baseURL`.
 
 - [ ] **Step 2: Run the model-provider test and verify failure**
 
@@ -367,7 +375,7 @@ export interface ChatCompletionResult {
 }
 ```
 
-- [ ] **Step 4: Implement direct fetch and response validation**
+- [ ] **Step 4: Implement the SDK-backed adapter and compatible fallback**
 
 Export:
 
@@ -388,6 +396,10 @@ export class OpenAICompatibleClient {
 ```
 
 Do not append URL paths or add provider-specific request fields. Convert OpenAI `prompt_tokens`, `completion_tokens`, and `total_tokens` into the camel-case result.
+
+Prefer the official `openai` package when the configured complete URL can be losslessly represented as an SDK `baseURL` plus `/chat/completions`. Keep `maxRetries: 0`, pass the turn's `AbortSignal`, and preserve the exact project-owned result and error shapes. If the complete URL uses a non-standard path, use the adapter's direct Worker `fetch` transport so the configured URL remains authoritative. The SDK object and its response types must not escape `packages/model-provider`.
+
+Both paths must run through the same response validation and the same Workers-runtime contract tests. A successful Node.js import or unit test alone is not acceptance evidence.
 
 - [ ] **Step 5: Run focused checks and commit after approval**
 
@@ -728,6 +740,8 @@ Expected: FAIL because `ExaSearchClient` does not exist.
 
 - [ ] **Step 3: Implement the direct REST client**
 
+Do not add `exa-js` in this task. The client must retain direct access to the current turn's `AbortSignal` and enforce timeout cancellation through Worker `fetch`; reconsider the SDK only after its published release supports both behaviors and the Workers-runtime tests pass.
+
 Export:
 
 ```ts
@@ -950,8 +964,8 @@ Update the four listed documents so they state:
 - group and C2C are both supported;
 - all supported webhooks are accepted and batching happens in the Agent;
 - behavior comes from source-controlled Markdown;
-- OpenAI-compatible Chat Completions is the only model protocol;
-- Exa powers search while direct Worker fetch powers webpage reading;
+- OpenAI-compatible Chat Completions is the only model protocol, with the official OpenAI SDK contained behind the project adapter when the configured endpoint is compatible;
+- Exa search and restricted webpage reading use direct Worker fetch so cancellation and web-safety limits remain project-owned;
 - configuration is environment/source based and there is no dashboard;
 - setup uses Wrangler secrets for all four required keys.
 

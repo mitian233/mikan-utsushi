@@ -24,9 +24,20 @@ GroupChatAgent (one Agent instance per group or C2C conversation)
        └─ QQ send_message
 ```
 
+## Workers runtime and SDK policy
+
+The Worker currently uses `compatibility_date: "2026-08-22"`. With this date, Workers' Node.js compatibility is enabled by default, but that compatibility layer is not a complete Node.js runtime. An SDK may install and import successfully while still relying on APIs that are unavailable or behave differently in Workers. Every SDK candidate therefore requires an actual Workers-runtime check, including its request, cancellation, timeout, error, and bundle behavior.
+
+SDK adoption is selective:
+
+- The official OpenAI SDK is the preferred candidate for the OpenAI-compatible model endpoint. It may be adopted only after it passes Workers-runtime contract tests that represent the configured endpoint; acceptance does not require a paid external call. A thin project adapter remains required so the model contract, endpoint configuration, response validation, `AbortSignal` cancellation, deadlines, and error semantics stay under project control.
+- The QQ Node SDK is not integrated as a whole. An isolated validation of a REST or protocol-specific subset is allowed when useful, but `QQBotClient` remains the production boundary. Its send idempotency and uncertain-result handling must be preserved; SDK retries must not create duplicate messages.
+- The Exa SDK is not used for `search_web` while its cancellation and timeout behavior is insufficient for this runtime. The implementation remains a direct `fetch` client.
+- `read_web` always uses a restricted direct Worker `fetch`. URL, redirect, network, media-type, size, timeout, and content handling are security boundaries and must not be delegated to a general-purpose SDK.
+
 ## QQ integration decision
 
-`pingBot` uses `@tencent-connect/qqbot-nodejs`, but that project runs on Node 20 + Nitro. This project deliberately does not carry that SDK into the Worker.
+`pingBot` uses `@tencent-connect/qqbot-nodejs`, but that project runs on Node 20 + Nitro. This project deliberately does not carry that SDK into the Worker as a whole; only isolated REST or protocol subset validation is permitted.
 
 The QQ boundary is split into two small responsibilities:
 

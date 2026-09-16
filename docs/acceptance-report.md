@@ -180,18 +180,65 @@
 pnpm typecheck                                        → 通过（5/6 workspace 项目，contracts 无测试文件正常跳过）
 pnpm test                                             → 通过
   apps/worker        10 files   74 tests
-  packages/qqbot      3 files   19 tests
-  packages/web-tools  5 files   38 tests
-  packages/model-provider 1 file 13 tests
+  packages/qqbot      3 files   20 tests
+  packages/web-tools  5 files   40 tests
+  packages/model-provider 1 file 14 tests
   packages/contracts 无测试文件，按配置退出 0
 pnpm --filter @mikan-utsushi/worker exec wrangler deploy --dry-run
-                                                      → 通过，2886.22 KiB / gzip 527.93 KiB
+                                                      → 通过
                                                         bindings: GROUP_CHAT_AGENT, QQ_API_BASE, QQ_TOKEN_URL
                                                         --dry-run: exiting now（未部署）
 git diff --check                                      → 通过，无输出
 ```
 
 **结论**：通过。
+
+## 本地 workerd 冒烟验证
+
+在真实 `wrangler dev`（workerd）中，用本地 mock 替代 QQ/LLM/Exa 端点（无真实凭据、无真实网络出口），通过 HTTP 驱动全部入口：
+
+| 检查项 | 结果 |
+| --- | --- |
+| `GET /health` | 200 `{"ok":true,...}` |
+| QQ 验证回调（op 13） | 200，返回 ed25519 signature |
+| 无效签名 | 401 `{"error":"invalid signature"}` |
+| 签名群消息 | 200 `{"op":12,"d":0}` |
+| 重复 event | 200，DB 中仍只有 1 条 inbound |
+| 签名 C2C 消息 | 200，独立 Agent |
+| 2 秒窗口批量 | 两条群消息合并为同一 turn（`turn_messages` 两条） |
+| LLM 工具循环 | 多次 completion，含 assistant/tool 往返回填 |
+| QQ token 请求 | `POST /token`，携带 `appId`/`clientSecret` |
+| 群聊发送 | `POST /v2/groups/{id}/messages`，`{"content":…,"msg_type":0}`，`Authorization: QQBot …` |
+| C2C 发送 | `POST /v2/users/{id}/messages` |
+| delivery 持久化 | `sent`，`turns.has_sent=1`，visible outbound message 写入 |
+| tool_calls 审计 | `send_message` / `completed`，arguments 为有界脱敏摘要 |
+| 普通文本不发送 | 模型返回纯文本的 turn 产生 0 次 QQ 请求 |
+| Agent 隔离 | group 与 C2C 落在不同 Durable Object SQLite 文件 |
+
+冒烟过程中发现并修复了一个 dry-run 与单元测试均无法发现的生产阻塞缺陷，见下节。
+
+## 冒烟发现并修复的生产缺陷
+
+**现象**：在 workerd 中，QQ token 请求抛 `TypeError: Illegal invocation: function called with incorrect \`this\` reference`。
+
+**根因**：把全局 `fetch` 取出存为字段后以方法形式调用，未绑定 `this`：
+
+```ts
+this.fetchFn = options.fetchFn ?? fetch;  // 取值时未绑定
+await this.fetchFn(...)                   // workerd 拒绝以非全局接收者调用
+```
+
+**影响**：`packages/qqbot/src/client.ts`（QQ 收发全部失败）、`packages/model-provider/src/openai-compatible.ts`（direct-fetch 分支）、`packages/web-tools/src/exa-search.ts`、`packages/web-tools/src/limited-fetch.ts`。
+
+**为何此前未发现**：所有相关测试都注入了 `fetchFn`，默认全局 `fetch` 路径从未在 Workers 池中执行；Wrangler dry-run 只证明可打包，不证明运行时行为。
+
+**修复**：四处均改为 `options.fetchFn ?? globalThis.fetch.bind(globalThis)`，并为每个位置补充 Workers 池回归测试（修复前真实 FAIL 并复现 `Illegal invocation`）。
+
+**验证**：修复后同一冒烟流程完成 token 获取与群聊、C2C 真实发送。
+
+## 本地配置说明
+
+`pnpm dev` 在 `apps/worker/` 下运行 `wrangler dev`，因此本地凭据必须位于 `apps/worker/.dev.vars`。放在仓库根目录的 `.dev.vars` 不会被加载，所有 Secret 会变为 undefined（表现为 QQ 验证回调 500）。README 已更正。
 
 ## 凭据与测试夹具
 
@@ -214,4 +261,6 @@ git diff --check                                      → 通过，无输出
 - 未执行生产部署、未配置 Wrangler Secrets、未在 QQ 开放平台注册回调 URL。
 - 未进行真实 QQ、LLM、Exa 调用。
 
-这些步骤需要用户提供凭据并明确授权。
+本地冒烟使用 mock 端点，可验证 Worker 路由、Durable Object、批处理、工具循环、QQ 请求形状与持久化状态，但不能证明真实 QQ 平台的凭据、频控与回调注册配置。
+
+生产上线步骤需要用户提供凭据并明确授权。

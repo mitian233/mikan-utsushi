@@ -29,11 +29,13 @@ docs/                    PRD、架构与项目分析
 
 ```bash
 pnpm install
-cp .dev.vars.example .dev.vars
+cp .dev.vars.example apps/worker/.dev.vars
 pnpm typecheck
 pnpm test
 pnpm dev
 ```
+
+`pnpm dev` 在 `apps/worker/` 下运行 `wrangler dev`，因此 Wrangler 读取的是 `apps/worker/.dev.vars`。放在仓库根目录的 `.dev.vars` 不会被加载，所有 Secret 会变成 undefined。
 
 本地 `.dev.vars`、生产 Wrangler Secrets 均不得提交。必需 Secret：
 
@@ -61,3 +63,4 @@ EXA_API_KEY
 - `docs/architecture.md`
 - `docs/project-analysis.md`
 - `docs/acceptance-report.md`
+- `docs/deployment.md`

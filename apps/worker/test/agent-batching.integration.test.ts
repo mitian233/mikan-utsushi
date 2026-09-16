@@ -354,7 +354,7 @@ describe("GroupChatAgent batching and retries", () => {
       }) as never;
       await seedMessage(agent, message("message-1"));
       await agent.flushPending();
-      const turnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
+      const firstTurnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
       state.storage.sql.exec(
         `INSERT INTO messages
          (event_id, message_id, direction, chat_kind, chat_id, user_id, text, images_json, status, created_at)
@@ -362,18 +362,30 @@ describe("GroupChatAgent batching and retries", () => {
                 ('new-event', 'new-message', 'outbound', 'group', 'batching-group', NULL, 'new', '[]', 'visible', 2)`,
       );
       agent.executeTurn = async () => ({ hasSent: false });
-      await agent.runTurn({ turnId });
+      await agent.runTurn({ turnId: firstTurnId });
+
+      // Retention is amortized across turns, so drive enough turns to reach
+      // the cleanup interval before asserting the window is bounded.
+      for (let i = 0; i < 10; i += 1) {
+        const turnId = `retention-${i}`;
+        state.storage.sql.exec(
+          `INSERT INTO turns (id, status, attempt_count, first_message_at, created_at)
+           VALUES (?, 'queued', 0, 1, ?)`,
+          turnId,
+          100 + i,
+        );
+        await agent.runTurn({ turnId });
+      }
+
       return {
-        messages: rows<{ message_id: string; status: string }>(state, "SELECT message_id, status FROM messages ORDER BY created_at, id"),
-        turns: rows<{ id: string }>(state, "SELECT id FROM turns"),
+        messages: rows<{ message_id: string; status: string }>(state, "SELECT message_id, status FROM messages WHERE status = 'visible' ORDER BY created_at, id"),
+        totalMessages: rows<{ n: number }>(state, "SELECT COUNT(*) AS n FROM messages")[0]?.n ?? 0,
       };
     });
 
-    expect(result.messages).toEqual([
-      { message_id: "new-message", status: "visible" },
-      { message_id: "message-message-1", status: "visible" },
-    ]);
-    expect(result.turns).toHaveLength(1);
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages.map((row) => row.message_id)).toEqual(["new-message", "message-message-1"]);
+    expect(result.totalMessages).toBe(2);
   });
 
   it("re-establishes a flush schedule after runTurn scheduling fails", async () => {

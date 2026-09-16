@@ -26,6 +26,15 @@ import { SCHEMA_STATEMENTS } from "./schema";
 const DEBOUNCE_SECONDS = 2;
 const SERIALIZATION_RETRY_SECONDS = 1;
 
+/**
+ * Retention scans read `messageRetentionLimit` rows to find the cutoff, so
+ * running one after every turn is the single largest source of Durable Object
+ * row reads. Batching them keeps the newest window bounded while making the
+ * amortized per-turn cost `limit / interval`.
+ */
+const RETENTION_CLEANUP_INTERVAL_TURNS = 10;
+const RETENTION_CLEANUP_KEY = "retention_turns_since_cleanup";
+
 export type TurnExecutionResult = {
   hasSent: boolean;
   termination?: "sent" | "silent";
@@ -238,6 +247,17 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       "UPDATE messages SET status = 'visible' WHERE turn_id = ? AND status = 'batched'",
       payload.turnId,
     );
+    await this.maybeCleanupVisibleMessages();
+  }
+
+  private async maybeCleanupVisibleMessages(): Promise<void> {
+    const elapsed = (await this.ctx.storage.get<number>(RETENTION_CLEANUP_KEY) ?? 0) + 1;
+    if (elapsed < RETENTION_CLEANUP_INTERVAL_TURNS) {
+      await this.ctx.storage.put(RETENTION_CLEANUP_KEY, elapsed);
+      return;
+    }
+
+    await this.ctx.storage.put(RETENTION_CLEANUP_KEY, 0);
     this.cleanupVisibleMessages(this.retentionLimit());
   }
 

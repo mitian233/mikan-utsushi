@@ -83,6 +83,8 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
     ON messages (turn_id, id)`,
   `CREATE INDEX IF NOT EXISTS idx_qq_turns_status_created
     ON turns (status, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_qq_turns_created
+    ON turns (created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_qq_turn_messages_position
     ON turn_messages (turn_id, position)`,
   `CREATE INDEX IF NOT EXISTS idx_qq_tool_calls_turn_status

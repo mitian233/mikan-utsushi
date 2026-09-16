@@ -36,7 +36,9 @@ async function handleQQWebhook(request: Request, env: Env): Promise<Response> {
 
   let payload: QQWebhookPayload;
   try {
-    payload = JSON.parse(new TextDecoder().decode(rawBody)) as QQWebhookPayload;
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(rawBody));
+    if (!isWebhookPayload(parsed)) return json({ error: "invalid payload" }, 400);
+    payload = parsed;
   } catch {
     return json({ error: "invalid json" }, 400);
   }
@@ -59,28 +61,48 @@ async function handleQQWebhook(request: Request, env: Env): Promise<Response> {
   const signature = request.headers.get("x-signature-ed25519");
   if (!timestamp || !signature) return json({ error: "missing signature" }, 401);
 
-  const valid = await verifyQQWebhookSignature({
-    body: rawBody,
-    timestamp,
-    signature,
-    appSecret: env.QQ_APP_SECRET,
-  });
+  let valid = false;
+  try {
+    valid = await verifyQQWebhookSignature({
+      body: rawBody,
+      timestamp,
+      signature,
+      appSecret: env.QQ_APP_SECRET,
+    });
+  } catch {
+    valid = false;
+  }
   if (!valid) return json({ error: "invalid signature" }, 401);
 
   if (payload.op === OP_DISPATCH) {
     const message = normalizeQQMessage(payload);
-    if (message) await enqueueMessage(message, env);
+    if (message) {
+      try {
+        await enqueueMessage(message, env);
+      } catch {
+        return json({ error: "agent unavailable" }, 503);
+      }
+    }
   }
 
   return json({ op: OP_HTTP_CALLBACK_ACK, d: 0 });
 }
 
 async function enqueueMessage(message: ChatMessage, env: Env): Promise<void> {
-  const id = env.GROUP_CHAT_AGENT.idFromName(`${message.platform}:${message.chatId}`);
+  const agentName = message.chatKind === "group"
+    ? `qq:group:${message.chatId}`
+    : `qq:c2c:${message.chatId}`;
+  const id = env.GROUP_CHAT_AGENT.idFromName(agentName);
   const stub = env.GROUP_CHAT_AGENT.get(id) as unknown as {
-    receiveMessage(input: ChatMessage): Promise<{ accepted: boolean }>;
+    receiveMessage(input: ChatMessage): Promise<{ accepted: true; duplicate: boolean }>;
   };
   await stub.receiveMessage(message);
+}
+
+function isWebhookPayload(value: unknown): value is QQWebhookPayload {
+  const payload = asRecord(value);
+  if (!payload || typeof payload.op !== "number" || asRecord(payload.d) === undefined) return false;
+  return payload.op === OP_VALIDATION || typeof payload.t === "string";
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

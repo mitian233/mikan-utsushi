@@ -1,35 +1,52 @@
 import type { ChatMessage } from "@mikan-utsushi/contracts";
 import { Agent } from "agents";
 import type { Env } from "../env";
+import { SCHEMA_STATEMENTS } from "./schema";
 
 const DEBOUNCE_SECONDS = 2;
 
 export class GroupChatAgent extends Agent<Env, Record<string, never>> {
-  async receiveMessage(message: ChatMessage): Promise<{ accepted: boolean }> {
+  onStart(): void {
+    this.ensureSchema();
+  }
+
+  async receiveMessage(message: ChatMessage): Promise<{ accepted: true; duplicate: boolean }> {
     this.ensureSchema();
 
-    this.ctx.storage.sql.exec(
+    const inserted = this.ctx.storage.sql.exec(
       `INSERT OR IGNORE INTO messages
-       (event_id, message_id, chat_id, chat_kind, user_id, username, text, images_json, timestamp, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+       (event_id, message_id, direction, chat_kind, chat_id, user_id, username, text,
+        images_json, reply_to_message_id, status, timestamp, created_at)
+       VALUES (?, ?, 'inbound', ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       message.eventId,
       message.messageId,
-      message.chatId,
       message.chatKind,
+      message.chatId,
       message.userId,
       message.username ?? null,
       message.text ?? null,
       JSON.stringify(message.images ?? []),
+      message.replyToMessageId ?? null,
       message.timestamp,
+      Date.now(),
     );
+
+    if (inserted.rowsWritten === 0) {
+      return { accepted: true, duplicate: true };
+    }
 
     const scheduled = await this.ctx.storage.get<boolean>("processor_scheduled");
     if (!scheduled) {
       await this.ctx.storage.put("processor_scheduled", true);
-      await this.schedule(DEBOUNCE_SECONDS, "processPending", {});
+      try {
+        await this.schedule(DEBOUNCE_SECONDS, "processPending", {});
+      } catch (error) {
+        await this.ctx.storage.delete("processor_scheduled");
+        throw error;
+      }
     }
 
-    return { accepted: true };
+    return { accepted: true, duplicate: false };
   }
 
   async processPending(): Promise<void> {
@@ -46,20 +63,8 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
   }
 
   private ensureSchema(): void {
-    this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        event_id TEXT NOT NULL UNIQUE,
-        message_id TEXT NOT NULL,
-        chat_id TEXT NOT NULL,
-        chat_kind TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        username TEXT,
-        text TEXT,
-        images_json TEXT NOT NULL,
-        timestamp INTEGER NOT NULL,
-        status TEXT NOT NULL
-      )
-    `);
+    for (const statement of SCHEMA_STATEMENTS) {
+      this.ctx.storage.sql.exec(statement);
+    }
   }
 }

@@ -3,28 +3,27 @@
   "name": "mikan-utsushi",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-22",
-  "rules": [
-    { "type": "Text", "globs": ["**/*.md"], "fallthrough": true }
-  ],
+  "rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
   "durable_objects": {
     "bindings": [
       {
         "name": "GROUP_CHAT_AGENT",
-        "class_name": "GroupChatAgent"
-      }
-    ]
+        "class_name": "GroupChatAgent",
+      },
+    ],
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["GroupChatAgent"]
-    }
+      "new_sqlite_classes": ["GroupChatAgent"],
+    },
   ],
   "vars": {
+    "LLM_CHAT_COMPLETIONS_URL": "https://api.deepseek.com/chat/completions",
     "QQ_API_BASE": "https://api.sgroup.qq.com",
-    "QQ_TOKEN_URL": "https://bots.qq.com/app/getAppAccessToken"
+    "QQ_TOKEN_URL": "https://bots.qq.com/app/getAppAccessToken",
   },
   "observability": {
-    "enabled": true
-  }
+    "enabled": true,
+  },
 }

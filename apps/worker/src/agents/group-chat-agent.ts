@@ -1,6 +1,10 @@
 import type { ChatMessage } from "@mikan-utsushi/contracts";
+import { OpenAICompatibleClient, type ModelToolCall } from "@mikan-utsushi/model-provider";
 import { Agent } from "agents";
-import type { Env } from "../env";
+import { SYSTEM_PROMPT } from "../prompts";
+import { parseRuntimeConfig, type Env, type RuntimeConfig } from "../env";
+import { buildInitialModelMessages, type ContextMessage } from "./context";
+import { runToolLoop, type ToolRuntime } from "./turn-runner";
 import { SCHEMA_STATEMENTS } from "./schema";
 
 const DEBOUNCE_SECONDS = 2;
@@ -219,12 +223,74 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
     await this.runTurn(payload);
   }
 
-  /**
-   * Task 6 replaces this boundary with the model/tool runner. Task 5 keeps
-   * turn persistence and retry semantics independent from that implementation.
-   */
-  async executeTurn(_turnId: string): Promise<TurnExecutionResult> {
-    return { hasSent: false };
+  async executeTurn(turnId: string): Promise<TurnExecutionResult> {
+    const runtimeConfig = this.getRuntimeConfig();
+    const turnRows = this.ctx.storage.sql
+      .exec<StoredMessageRow>(
+        `SELECT m.id, m.direction, m.status, m.text, m.images_json, m.user_id
+         FROM turn_messages tm
+         JOIN messages m ON m.id = tm.message_id
+         WHERE tm.turn_id = ?
+         ORDER BY tm.position`,
+        turnId,
+      )
+      .toArray();
+    const recentRows = this.ctx.storage.sql
+      .exec<StoredMessageRow>(
+        `SELECT id, direction, status, text, images_json, user_id
+         FROM messages
+         WHERE status = 'visible'
+         ORDER BY created_at DESC, id DESC
+         LIMIT ?`,
+        runtimeConfig.contextMessageLimit,
+      )
+      .toArray()
+      .reverse();
+    const turnMessages = turnRows.map(toContextMessage);
+    const recentVisibleMessages = recentRows.map(toContextMessage);
+    const messages = buildInitialModelMessages({
+      systemPrompt: SYSTEM_PROMPT,
+      runtimeConfig,
+      turnMessages,
+      recentVisibleMessages,
+    });
+    const client = this.createModelClient(runtimeConfig);
+    const runtime = this.createToolRuntime();
+    const result = await runToolLoop({
+      client,
+      messages,
+      tools: [],
+      runtime,
+      context: {
+        turnId,
+        speakerId: turnMessages.find((message) => message.direction === "inbound")?.userId ?? undefined,
+      },
+    });
+    return { hasSent: result.sentCount > 0 };
+  }
+
+  protected getRuntimeConfig(): RuntimeConfig {
+    return parseRuntimeConfig(this.env);
+  }
+
+  protected createModelClient(config: RuntimeConfig): OpenAICompatibleClient {
+    return new OpenAICompatibleClient({
+      url: config.llmUrl,
+      apiKey: config.llmApiKey,
+      model: config.model,
+    });
+  }
+
+  protected createToolRuntime(): ToolRuntime {
+    return {
+      execute: async (call: ModelToolCall) => ({
+        content: JSON.stringify({
+          error: "Unknown tool",
+          name: call.function.name,
+        }),
+        sentCount: 0,
+      }),
+    };
   }
 
   private turnHasSent(turnId: string): boolean {
@@ -276,6 +342,38 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       this.ctx.storage.sql.exec(statement);
     }
   }
+}
+
+interface StoredMessageRow extends Record<string, string | number | null> {
+  id: number;
+  direction: "inbound" | "outbound";
+  status: ContextMessage["status"];
+  text: string | null;
+  images_json: string;
+  user_id: string | null;
+}
+
+function toContextMessage(row: StoredMessageRow): ContextMessage {
+  let images: Array<{ url: string }> = [];
+  try {
+    const parsed = JSON.parse(row.images_json) as unknown;
+    if (Array.isArray(parsed)) {
+      images = parsed.filter(
+        (image): image is { url: string } =>
+          typeof image === "object" && image !== null && typeof (image as { url?: unknown }).url === "string",
+      );
+    }
+  } catch {
+    images = [];
+  }
+  return {
+    id: String(row.id),
+    direction: row.direction,
+    status: row.status,
+    text: row.text,
+    images,
+    userId: row.user_id,
+  };
 }
 
 function errorMessage(error: unknown): string {

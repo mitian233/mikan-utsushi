@@ -130,6 +130,9 @@ importers:
       '@mikan-utsushi/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@mikan-utsushi/model-provider':
+        specifier: workspace:*
+        version: link:../../packages/model-provider
       '@mikan-utsushi/qqbot':
         specifier: workspace:*
         version: link:../../packages/qqbot

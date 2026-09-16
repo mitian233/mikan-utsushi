@@ -1,4 +1,4 @@
-import type { ChatMessage } from "@mikan-utsushi/contracts";
+import type { ChatMessage, ImageReference } from "@mikan-utsushi/contracts";
 import type { QQWebhookPayload } from "./types";
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -7,6 +7,29 @@ function record(value: unknown): Record<string, unknown> | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function textValue(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  return text.length > 0 ? text : undefined;
+}
+
+function normalizeImages(value: unknown): ImageReference[] {
+  if (!Array.isArray(value)) return [];
+
+  return value.flatMap((item): ImageReference[] => {
+    const attachment = record(item);
+    const url = stringValue(attachment?.url);
+    if (!url) return [];
+
+    const fileId = stringValue(attachment?.filename);
+    return fileId ? [{ url, fileId }] : [{ url }];
+  });
+}
+
+function replyToMessageId(value: unknown): string | undefined {
+  return stringValue(record(value)?.message_id);
 }
 
 function timestamp(value: unknown): number {
@@ -22,28 +45,33 @@ export function normalizeQQMessage(payload: QQWebhookPayload): ChatMessage | nul
   const eventId = stringValue(payload.id) ?? messageId;
   if (!data || !messageId || !eventId) return null;
 
-  const text = stringValue(data.content)?.trim();
+  const text = textValue(data.content);
+  const images = normalizeImages(data.attachments);
+  const replyId = replyToMessageId(data.message_reference);
   const username = stringValue(author?.username);
-  const userId = stringValue(author?.member_openid) ?? stringValue(author?.id);
+  if (!text && images.length === 0) return null;
 
   if (payload.t === "GROUP_AT_MESSAGE_CREATE") {
     const groupId = stringValue(data.group_openid);
-    if (!groupId || !userId) return null;
+    const memberOpenId = stringValue(author?.member_openid);
+    if (!groupId || !memberOpenId) return null;
     return {
       platform: "qq",
       eventId,
       messageId,
       chatId: groupId,
       chatKind: "group",
-      userId,
+      userId: memberOpenId,
       username,
       text,
+      images,
+      replyToMessageId: replyId,
       timestamp: timestamp(data.timestamp),
     };
   }
 
   if (payload.t === "C2C_MESSAGE_CREATE") {
-    const userOpenId = stringValue(author?.user_openid) ?? userId;
+    const userOpenId = stringValue(author?.user_openid);
     if (!userOpenId) return null;
     return {
       platform: "qq",
@@ -54,6 +82,8 @@ export function normalizeQQMessage(payload: QQWebhookPayload): ChatMessage | nul
       userId: userOpenId,
       username,
       text,
+      images,
+      replyToMessageId: replyId,
       timestamp: timestamp(data.timestamp),
     };
   }

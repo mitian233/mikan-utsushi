@@ -3,20 +3,21 @@ export type Platform = "qq";
 export type ChatKind = "group" | "c2c";
 
 export interface ImageReference {
+  url: string;
   fileId?: string;
-  url?: string;
 }
 
 export interface ChatMessage {
-  platform: Platform;
+  platform: "qq";
   eventId: string;
   messageId: string;
   chatId: string;
-  chatKind: ChatKind;
+  chatKind: "group" | "c2c";
   userId: string;
   username?: string;
   text?: string;
-  images?: ImageReference[];
+  images: Array<{ url: string; fileId?: string }>;
+  replyToMessageId?: string;
   timestamp: number;
 }
 

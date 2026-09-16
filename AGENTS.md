@@ -41,10 +41,6 @@
 - 使用 pnpm workspace；依赖版本必须可复现，避免 `latest` 浮动依赖。
 - 不放宽 pnpm 的供应链冷却策略，不使用 `minimumReleaseAgeExclude` 绕过新包检查。
 - 安装依赖、生成 lockfile、创建分支/worktree、部署和提交前先向用户说明并取得授权；本项目当前用户已明确允许按批次提交。
-- 每个提交使用 Git 默认身份 `mitian233 <mitian233@yahoo.co.jp>`，并包含：
-
-  `Co-Authored-By: openai-code-agent[bot] <242516109+Codex@users.noreply.github.com>`
-
 - 提交只包含当前批次所属文件，不要把 `.dev.vars`、node_modules、临时报告或其他无关改动带入提交。
 
 ## 参考文档

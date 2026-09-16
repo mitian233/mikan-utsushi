@@ -22,6 +22,9 @@ type MemoryRecord = {
   updatedAt: number;
 };
 
+export type SendMessageResult = QQSendResult | { outcome: "silent" };
+export type TerminalSendMessageResult = Exclude<SendMessageResult, { outcome: "failed" }>;
+
 type DeliveryRow = {
   id: string;
   turn_id: string;
@@ -200,7 +203,7 @@ function optionalScope(args: Record<string, unknown>): MemoryScope {
   return value;
 }
 
-function isAcceptedDelivery(value: unknown): value is { outcome: "sent" | "unknown" | "silent" } {
+function isTerminalSendMessageResult(value: unknown): value is TerminalSendMessageResult {
   return typeof value === "object" && value !== null &&
     ((value as { outcome?: unknown }).outcome === "sent" ||
       (value as { outcome?: unknown }).outcome === "unknown" ||
@@ -369,15 +372,17 @@ export class MemoryToolRuntime implements ToolRuntime {
     try {
       const args = parseArguments(call);
       const result = await this.executeToolCall(call.function.name, args, context, call.id);
-      const isTerminal = call.function.name === "send_message" && isAcceptedDelivery(result);
-      const sentCount = isTerminal && (result as { outcome: string }).outcome === "sent" ? 1 : 0;
-      const termination = isTerminal
-        ? ((result as { outcome: string }).outcome === "silent" ? "silent" : "sent")
+      const terminalResult = call.function.name === "send_message" && isTerminalSendMessageResult(result)
+        ? result
+        : undefined;
+      const sentCount = terminalResult?.outcome === "sent" || terminalResult?.outcome === "unknown" ? 1 : 0;
+      const termination = terminalResult
+        ? (terminalResult.outcome === "silent" ? "silent" : "sent")
         : undefined;
       return {
         content: JSON.stringify(result),
         sentCount,
-        terminal: isTerminal,
+        terminal: terminalResult !== undefined,
         termination,
       };
     } catch (error) {
@@ -425,10 +430,10 @@ export class MemoryToolRuntime implements ToolRuntime {
     return this.readWebFn(url, { signal: context.signal });
   }
 
-  private async sendMessage(args: Record<string, unknown>, context: ToolExecutionContext, toolCallId: string): Promise<QQSendResult> {
-    const action = requiredString(args, "action");
+  private async sendMessage(args: Record<string, unknown>, context: ToolExecutionContext, toolCallId: string): Promise<SendMessageResult> {
+    const action = args.action === undefined ? "send" : requiredString(args, "action");
     if (action !== "send" && action !== "silent") throw new Error("action must be send or silent");
-    if (action === "silent") return { outcome: "silent" } as QQSendResult;
+    if (action === "silent") return { outcome: "silent" };
     if (!this.qqClient) throw new Error("send_message is unavailable");
     if (!context.chatKind || !context.chatId) throw new Error("Current QQ conversation is unavailable");
     const content = requiredString(args, "content");

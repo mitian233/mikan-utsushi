@@ -88,15 +88,19 @@ describe("complete group and C2C conversation flows", () => {
           complete: async (input) => {
             modelInputs.push(structuredClone(input.messages));
             completionCount += 1;
-            return completionCount === 1
-              ? completion([
-                  toolCall("memory-call", "memory_search", { query: "hello", scope: "group" }),
-                  toolCall("search-call", "search_web", { query: "current" }),
-                  toolCall("read-call", "read_web", { url: "https://example.test/secret" }),
-                  toolCall("send-call-1", "send_message", { content: "first" }),
-                  toolCall("send-call-2", "send_message", { content: "second" }),
-                ])
-              : completion();
+            if (completionCount === 1) {
+              return completion([
+                toolCall("memory-call", "memory_search", { query: "hello", scope: "group" }),
+                toolCall("search-call", "search_web", { query: "current" }),
+                toolCall("read-call", "read_web", { url: "https://example.test/secret" }),
+              ]);
+            }
+            if (completionCount === 2) {
+              return completion([
+                toolCall("send-call-1", "send_message", { action: "send", content: "first" }),
+              ]);
+            }
+            throw new Error("unexpected extra model round");
           },
         });
         agent.createToolRuntime = () => new MemoryToolRuntime(state.storage.sql, {
@@ -135,13 +139,11 @@ describe("complete group and C2C conversation flows", () => {
 
     expect(observed.sendTargets).toEqual([
       { scope: kind, targetId: chatId, content: "first" },
-      { scope: kind, targetId: chatId, content: "second" },
     ]);
     expect(observed.deliveries).toEqual([
       { tool_call_id: "send-call-1", status: "sent" },
-      { tool_call_id: "send-call-2", status: "sent" },
     ]);
-    expect(observed.toolCalls).toHaveLength(5);
+    expect(observed.toolCalls).toHaveLength(4);
     expect(observed.toolCalls.every(({ id }: { id: string }) => /^sha256:[0-9a-f]{64}$/.test(id))).toBe(true);
     expect(observed.toolCalls
       .map(({ name, status }: { name: string; status: string }) => ({ name, status }))
@@ -149,7 +151,6 @@ describe("complete group and C2C conversation flows", () => {
       { name: "memory_search", status: "completed" },
       { name: "read_web", status: "completed" },
       { name: "search_web", status: "completed" },
-      { name: "send_message", status: "completed" },
       { name: "send_message", status: "completed" },
     ]);
     const readAudit = observed.toolCalls.find(({ name }: { name: string }) => name === "read_web") as { arguments_json: string; result_json: string };
@@ -164,7 +165,6 @@ describe("complete group and C2C conversation flows", () => {
     expect(observed.messages).toEqual([
       { direction: "inbound", chat_kind: kind, chat_id: chatId, text: "hello", status: "visible" },
       { direction: "outbound", chat_kind: kind, chat_id: chatId, text: "first", status: "visible" },
-      { direction: "outbound", chat_kind: kind, chat_id: chatId, text: "second", status: "visible" },
     ]);
 
     const initial = observed.modelInputs[0] ?? [];

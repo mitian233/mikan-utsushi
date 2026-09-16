@@ -37,8 +37,8 @@ describe("durable send_message", () => {
           signal: new AbortController().signal,
         };
 
-        const first = await runtime.execute(call("call-1", { content: "reply", reply_to_message_id: "in-1" }), context);
-        const second = await runtime.execute(call("call-1", { content: "reply", reply_to_message_id: "in-1" }), context);
+        const first = await runtime.execute(call("call-1", { action: "send", content: "reply", reply_to_message_id: "in-1" }), context);
+        const second = await runtime.execute(call("call-1", { action: "send", content: "reply", reply_to_message_id: "in-1" }), context);
 
         return {
           first: JSON.parse(first.content),
@@ -84,7 +84,7 @@ describe("durable send_message", () => {
         const sendText = vi.fn(async () => ({ outcome: "sent" as const, messageId: "should-not-send" }));
         const runtime = new MemoryToolRuntime(state.storage.sql, { qqClient: { sendText } });
         const result = await runtime.execute(
-          call("call-recovery", { content: "recovered" }),
+          call("call-recovery", { action: "send", content: "recovered" }),
           {
             turnId: "turn-recovery",
             chatKind: "group",
@@ -125,7 +125,7 @@ describe("durable send_message", () => {
         const transactionSync = vi.fn(<T>(closure: () => T) => state.storage.transactionSync(closure));
         const runtime = new MemoryToolRuntime(state.storage.sql, { qqClient: { sendText }, transactionSync });
         const result = await runtime.execute(
-          call("call-planned", { content: "reply" }),
+          call("call-planned", { action: "send", content: "reply" }),
           {
             turnId: "turn-planned",
             chatKind: "group",
@@ -173,8 +173,8 @@ describe("durable send_message", () => {
           chatId: "failed-delivery",
           signal: new AbortController().signal,
         };
-        const first = await runtime.execute(call("call-failed", { content: "retry" }), context);
-        const second = await runtime.execute(call("call-failed", { content: "retry" }), context);
+        const first = await runtime.execute(call("call-failed", { action: "send", content: "retry" }), context);
+        const second = await runtime.execute(call("call-failed", { action: "send", content: "retry" }), context);
         return {
           first: JSON.parse(first.content),
           second: JSON.parse(second.content),
@@ -209,7 +209,7 @@ describe("durable send_message", () => {
           },
         });
         const output = await runtime.execute(
-          call("call-transaction", { content: "uncertain" }),
+          call("call-transaction", { action: "send", content: "uncertain" }),
           {
             turnId: "turn-transaction",
             chatKind: "group",
@@ -252,8 +252,8 @@ describe("durable send_message", () => {
           chatId: "delivery-user",
           signal: new AbortController().signal,
         };
-        const first = await runtime.execute(call("call-unknown", { content: "maybe" }), context);
-        const second = await runtime.execute(call("call-unknown", { content: "maybe" }), context);
+        const first = await runtime.execute(call("call-unknown", { action: "send", content: "maybe" }), context);
+        const second = await runtime.execute(call("call-unknown", { action: "send", content: "maybe" }), context);
         return {
           first: JSON.parse(first.content),
           second: JSON.parse(second.content),

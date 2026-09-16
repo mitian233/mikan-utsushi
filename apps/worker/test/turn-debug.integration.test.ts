@@ -10,7 +10,14 @@ type TestAgent = {
   createModelClient(config: unknown): {
     complete(input: { messages: ModelMessage[] }, signal: AbortSignal): Promise<ChatCompletionResult>;
   };
-  createToolRuntime(config?: unknown): { execute(): Promise<{ content: string; sentCount: number }> };
+  createToolRuntime(config?: unknown): {
+    execute(call: ModelToolCall): Promise<{
+      content: string;
+      sentCount: number;
+      terminal?: boolean;
+      termination?: "sent" | "silent";
+    }>;
+  };
 };
 
 type DebugRow = {
@@ -80,7 +87,14 @@ async function runTurnWithDebug(
       complete: async () => replies[Math.min(index++, replies.length - 1)] as ChatCompletionResult,
     });
     agent.createToolRuntime = () => ({
-      execute: async () => ({ content: JSON.stringify({ ok: true }), sentCount: 0 }),
+      execute: async (call) => call.function.name === "send_message"
+        ? {
+            content: JSON.stringify({ outcome: "silent" }),
+            sentCount: 0,
+            terminal: true,
+            termination: "silent",
+          }
+        : { content: JSON.stringify({ ok: true }), sentCount: 0 },
     });
 
     await agent.executeTurn(turnId);
@@ -94,14 +108,16 @@ async function runTurnWithDebug(
 
 describe("turn debug capture", () => {
   it("writes nothing when debug capture is disabled", async () => {
-    const { debug } = await runTurnWithDebug(false, [completion("plain reply")]);
+    const { debug } = await runTurnWithDebug(false, [
+      completion(null, [toolCall("silent-call", "send_message", { action: "silent" })]),
+    ]);
     expect(debug).toEqual([]);
   });
 
   it("records each model round request and raw response when enabled", async () => {
     const { debug } = await runTurnWithDebug(true, [
       completion(null, [toolCall("call-1", "memory_search", { query: "hello" })]),
-      completion("final reply"),
+      completion(null, [toolCall("silent-call", "send_message", { action: "silent" })]),
     ]);
 
     const events = debug.map((row) => row.event);
@@ -118,12 +134,17 @@ describe("turn debug capture", () => {
 
     const secondResponse = debug.find((row) => row.round === 2 && row.event === "model_response");
     expect(JSON.parse(secondResponse?.payload ?? "{}")).toMatchObject({
-      message: { content: "final reply", toolCalls: [] },
+      message: {
+        content: null,
+        toolCalls: [{ id: "silent-call", function: { name: "send_message", arguments: JSON.stringify({ action: "silent" }) } }],
+      },
     });
   });
 
   it("records the raw request messages including the system prompt", async () => {
-    const { debug } = await runTurnWithDebug(true, [completion("done")]);
+    const { debug } = await runTurnWithDebug(true, [
+      completion(null, [toolCall("silent-call", "send_message", { action: "silent" })]),
+    ]);
     const request = debug.find((row) => row.event === "model_request");
     const payload = JSON.parse(request?.payload ?? "{}") as { messages?: Array<{ role: string }>; tools?: unknown[] };
     expect(payload.messages?.[0]?.role).toBe("system");
@@ -134,7 +155,7 @@ describe("turn debug capture", () => {
   it("records the tool result of the previous round on the next request", async () => {
     const { debug } = await runTurnWithDebug(true, [
       completion(null, [toolCall("call-1", "memory_search", { query: "hello" })]),
-      completion("done"),
+      completion(null, [toolCall("silent-call", "send_message", { action: "silent" })]),
     ]);
     const secondRequest = debug.find((row) => row.round === 2 && row.event === "model_request");
     const payload = JSON.parse(secondRequest?.payload ?? "{}") as { messages?: Array<{ role: string; tool_call_id?: string }> };

@@ -66,12 +66,72 @@ describe("web tool runtime registration", () => {
     } as SqlStorage, { qqClient: { sendText } });
     const turnContext = { ...context(), chatKind: "group" as const, chatId: "group-1" };
 
-    await runtime.execute(call("send_message", { content: "reply" }), turnContext);
+    await runtime.execute(call("send_message", { action: "send", content: "reply" }), turnContext);
     expect(sendText).toHaveBeenCalledWith(
       { scope: "group", targetId: "group-1" },
       "reply",
       turnContext.signal,
     );
+  });
+
+  it("bridges a legacy content-only send_message call to an explicit send", async () => {
+    const sendText = vi.fn(async () => ({ outcome: "failed" as const, status: 429 }));
+    const runtime = new MemoryToolRuntime({
+      exec: (() => ({ toArray: () => [], rowsWritten: 0 })) as unknown as SqlStorage["exec"],
+    } as SqlStorage, { qqClient: { sendText } });
+    const turnContext = { ...context(), chatKind: "group" as const, chatId: "group-legacy" };
+
+    const result = await runtime.execute(call("send_message", { content: "legacy reply" }), turnContext);
+
+    expect(JSON.parse(result.content)).toEqual({ outcome: "failed", status: 429 });
+    expect(result.terminal).toBe(false);
+    expect(result.termination).toBeUndefined();
+    expect(sendText).toHaveBeenCalledWith(
+      { scope: "group", targetId: "group-legacy" },
+      "legacy reply",
+      turnContext.signal,
+    );
+  });
+
+  it("returns a terminal silent result without requiring QQ delivery", async () => {
+    const sendText = vi.fn();
+    const runtime = new MemoryToolRuntime({} as SqlStorage, { qqClient: { sendText } });
+
+    const result = await runtime.execute(call("send_message", { action: "silent" }), context());
+
+    expect(JSON.parse(result.content)).toEqual({ outcome: "silent" });
+    expect(result).toMatchObject({ sentCount: 0, terminal: true, termination: "silent" });
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid action without treating it as a terminal result", async () => {
+    const sendText = vi.fn();
+    const runtime = new MemoryToolRuntime({} as SqlStorage, { qqClient: { sendText } });
+
+    const result = await runtime.execute(call("send_message", { action: "later", content: "reply" }), {
+      ...context(),
+      chatKind: "group",
+      chatId: "group-invalid-action",
+    });
+
+    expect(JSON.parse(result.content)).toEqual({ error: "action must be send or silent" });
+    expect(result.terminal).toBeUndefined();
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it("keeps a content-less call invalid when the legacy action is absent", async () => {
+    const sendText = vi.fn();
+    const runtime = new MemoryToolRuntime({} as SqlStorage, { qqClient: { sendText } });
+
+    const result = await runtime.execute(call("send_message", {}), {
+      ...context(),
+      chatKind: "group",
+      chatId: "group-missing-content",
+    });
+
+    expect(JSON.parse(result.content)).toEqual({ error: "content must be a non-empty string" });
+    expect(result.terminal).toBeUndefined();
+    expect(sendText).not.toHaveBeenCalled();
   });
 
   it("dispatches read_web with the turn abort signal and preserves trust", async () => {

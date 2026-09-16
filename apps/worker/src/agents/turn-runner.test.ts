@@ -25,6 +25,14 @@ function toolCall(id: string, value: string): ModelToolCall {
   };
 }
 
+function sendCall(id: string, args: Record<string, unknown>): ModelToolCall {
+  return {
+    id,
+    type: "function",
+    function: { name: "send_message", arguments: JSON.stringify(args) },
+  };
+}
+
 function completion(content: string | null, toolCalls: ModelToolCall[] = [], totalTokens = 1): ChatCompletionResult {
   return {
     message: { role: "assistant", content, toolCalls },
@@ -173,6 +181,114 @@ describe("runToolLoop", () => {
     await expect(runToolLoop({ client, messages: [], tools: [tool], runtime, context: { turnId: "turn-required" } }))
       .resolves.toMatchObject({ termination: "silent" });
     expect(inputs[1]).toContainEqual({ role: "user", content: "The previous response did not call the terminal send_message tool. Call send_message with action=send or action=silent to finish this turn; do not answer with plain text." });
+  });
+
+  it("finishes on an explicit send and counts the delivered message", async () => {
+    const client = {
+      complete: async () => completion(null, [sendCall("send-1", { action: "send", content: "reply" })], 7),
+    };
+    const runtime: ToolRuntime = {
+      execute: async () => ({
+        content: JSON.stringify({ outcome: "sent", messageId: "qq-1" }),
+        sentCount: 1,
+        terminal: true,
+        termination: "sent",
+      }),
+    };
+
+    await expect(runToolLoop({ client, messages: [], tools: [tool], runtime, context: { turnId: "turn-send" } }))
+      .resolves.toEqual({ sentCount: 1, termination: "sent", usage: [{ totalTokens: 7 }] });
+  });
+
+  it("rejects a mixed work and terminal response before accepting a later terminal call", async () => {
+    const inputs: ModelMessage[][] = [];
+    const responses = [
+      completion(null, [
+        toolCall("lookup-1", "one"),
+        sendCall("send-mixed", { action: "send", content: "reply" }),
+      ]),
+      completion(null, [sendCall("send-valid", { action: "silent" })]),
+    ];
+    const client = {
+      complete: async (input: { messages: ModelMessage[]; tools: ModelToolDefinition[] }) => {
+        inputs.push(structuredClone(input.messages));
+        return responses.shift()!;
+      },
+    };
+    const executions: string[] = [];
+    const runtime: ToolRuntime = {
+      execute: async (call) => {
+        executions.push(call.id);
+        return { content: JSON.stringify({ outcome: "silent" }), terminal: true, termination: "silent" };
+      },
+    };
+
+    await expect(runToolLoop({ client, messages: [], tools: [tool], runtime, context: { turnId: "turn-mixed" } }))
+      .resolves.toMatchObject({ sentCount: 0, termination: "silent" });
+    expect(executions).toEqual(["send-valid"]);
+    expect(inputs[1]).toContainEqual({
+      role: "tool",
+      tool_call_id: "lookup-1",
+      content: JSON.stringify({ error: "send_message must be the only tool call in the terminal response" }),
+    });
+    expect(inputs[1]).toContainEqual({
+      role: "tool",
+      tool_call_id: "send-mixed",
+      content: JSON.stringify({ error: "send_message must be the only tool call in the terminal response" }),
+    });
+  });
+
+  it("rejects multiple terminal calls in one response", async () => {
+    const inputs: ModelMessage[][] = [];
+    const responses = [
+      completion(null, [
+        sendCall("send-first", { action: "send", content: "first" }),
+        sendCall("send-second", { action: "send", content: "second" }),
+      ]),
+      completion(null, [sendCall("send-retry", { action: "silent" })]),
+    ];
+    const client = {
+      complete: async (input: { messages: ModelMessage[]; tools: ModelToolDefinition[] }) => {
+        inputs.push(structuredClone(input.messages));
+        return responses.shift()!;
+      },
+    };
+    const executions: string[] = [];
+    const runtime: ToolRuntime = {
+      execute: async (call) => {
+        executions.push(call.id);
+        return { content: JSON.stringify({ outcome: "silent" }), terminal: true, termination: "silent" };
+      },
+    };
+
+    await expect(runToolLoop({ client, messages: [], tools: [tool], runtime, context: { turnId: "turn-duplicate-terminal" } }))
+      .resolves.toMatchObject({ termination: "silent" });
+    expect(executions).toEqual(["send-retry"]);
+    expect(inputs[1]).toContainEqual(expect.objectContaining({
+      role: "tool",
+      tool_call_id: "send-first",
+      content: JSON.stringify({ error: "send_message must be the only tool call in the terminal response" }),
+    }));
+    expect(inputs[1]).toContainEqual(expect.objectContaining({
+      role: "tool",
+      tool_call_id: "send-second",
+      content: JSON.stringify({ error: "send_message must be the only tool call in the terminal response" }),
+    }));
+  });
+
+  it("stops after twelve non-terminal rounds", async () => {
+    let completionCount = 0;
+    const client = {
+      complete: async () => {
+        completionCount += 1;
+        return completion("still thinking");
+      },
+    };
+    const runtime: ToolRuntime = { execute: async () => ({ content: "unused" }) };
+
+    await expect(runToolLoop({ client, messages: [], tools: [tool], runtime, context: { turnId: "turn-max-rounds" } }))
+      .rejects.toThrow("within 12 rounds");
+    expect(completionCount).toBe(12);
   });
 
   it("uses one shared 120-second deadline for model and tool work", async () => {

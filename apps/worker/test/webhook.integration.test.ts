@@ -143,7 +143,7 @@ describe("QQ webhook integration", () => {
                   toolCalls: [{
                     id: "e2e-send-call",
                     type: "function" as const,
-                    function: { name: "send_message", arguments: JSON.stringify({ content: "webhook reply" }) },
+                    function: { name: "send_message", arguments: JSON.stringify({ action: "send", content: "webhook reply" }) },
                   }],
                 },
                 usage: { totalTokens: 1 },
@@ -220,7 +220,7 @@ describe("QQ webhook integration", () => {
                   toolCalls: [{
                     id: "e2e-c2c-send-call",
                     type: "function" as const,
-                    function: { name: "send_message", arguments: JSON.stringify({ content: "c2c reply" }) },
+                    function: { name: "send_message", arguments: JSON.stringify({ action: "send", content: "c2c reply" }) },
                   }],
                 },
                 usage: { totalTokens: 1 },

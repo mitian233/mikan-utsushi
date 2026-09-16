@@ -11,7 +11,7 @@ import { SCHEMA_STATEMENTS } from "../src/agents/schema";
 import type { ToolRuntime } from "../src/agents/turn-runner";
 
 type TestAgent = {
-  executeTurn(turnId: string): Promise<{ hasSent: boolean }>;
+  executeTurn(turnId: string): Promise<{ hasSent: boolean; termination?: "sent" | "silent" }>;
   getRuntimeConfig(): unknown;
   createModelClient(config: unknown): {
     complete: (
@@ -101,7 +101,13 @@ describe("GroupChatAgent.executeTurn integration", () => {
           completions.push(structuredClone(input.messages));
           return completions.length === 1
             ? completion(null, [toolCall("unknown-call")])
-            : completion("done");
+            : completion(null, [
+                {
+                  id: "silent-call",
+                  type: "function",
+                  function: { name: "send_message", arguments: JSON.stringify({ action: "silent" }) },
+                },
+              ]);
         },
       });
       const defaultRuntime = agent.createToolRuntime();
@@ -117,7 +123,7 @@ describe("GroupChatAgent.executeTurn integration", () => {
       return { result, completions, executionContext };
     });
 
-    expect(observed.result).toEqual({ hasSent: false });
+    expect(observed.result).toEqual({ hasSent: false, termination: "silent" });
     expect(observed.executionContext?.turnId).toBe("task6-turn-1");
     expect(observed.executionContext?.speakerId).toBe("member-real-openid");
     expect(observed.completions[0]).toContainEqual({ role: "system", content: SYSTEM_PROMPT });

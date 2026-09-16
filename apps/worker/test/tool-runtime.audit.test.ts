@@ -17,7 +17,7 @@ describe("tool-call audit summaries", () => {
 
   it("maps unknown tool names to unknown and hashes audit identifiers", async () => {
     const unknownName = "send_message-SECRET-".repeat(200);
-    const summary = summarizeToolArguments(unknownName, JSON.stringify({ content: "SECRET" }));
+    const summary = summarizeToolArguments(unknownName, JSON.stringify({ action: "send", content: "SECRET" }));
     const callId = await hashAuditIdentifier("call-SECRET-".repeat(500));
     const turnId = await hashAuditIdentifier("turn-SECRET-".repeat(500));
 
@@ -36,7 +36,7 @@ describe("tool-call audit summaries", () => {
     ["memory_search", { query: "MEMORY-SECRET-".repeat(1_000), scope: "user", "UNKNOWN-SECRET-KEY": "hidden" }],
     ["search_web", { query: "SEARCH-SECRET-".repeat(1_000), "UNKNOWN-SECRET-KEY": "hidden" }],
     ["read_web", { url: `https://example.test/${"URL-SECRET-".repeat(1_000)}`, "UNKNOWN-SECRET-KEY": "hidden" }],
-    ["send_message", { content: "MESSAGE-SECRET-".repeat(1_000), reply_to_message_id: "REPLY-SECRET-".repeat(1_000), "UNKNOWN-SECRET-KEY": "hidden" }],
+    ["send_message", { action: "send", content: "MESSAGE-SECRET-".repeat(1_000), reply_to_message_id: "REPLY-SECRET-".repeat(1_000), "UNKNOWN-SECRET-KEY": "hidden" }],
   ] as const)("does not persist complete %s arguments or unknown keys", (name, args) => {
     const summary = summarizeToolArguments(name, JSON.stringify(args));
 
@@ -82,6 +82,7 @@ describe("tool-call audit summaries", () => {
 
   it("keeps the audit summary at the 1000-character boundary", () => {
     const summary = summarizeToolArguments("send_message", JSON.stringify({
+      action: "send",
       content: "x".repeat(1001),
     }));
 

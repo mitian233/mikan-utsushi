@@ -22,8 +22,9 @@
     "LLM_CHAT_COMPLETIONS_URL": "https://api.deepseek.com/chat/completions",
     "QQ_API_BASE": "https://api.sgroup.qq.com",
     "QQ_TOKEN_URL": "https://bots.qq.com/app/getAppAccessToken",
+    "TURN_DEBUG_ENABLED": "true",
   },
   "observability": {
-    "enabled": true,
+    "enabled": false,
   },
 }

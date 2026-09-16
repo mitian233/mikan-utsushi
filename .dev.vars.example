@@ -5,3 +5,16 @@ QQ_APP_SECRET=
 # Optional overrides for local tests or a compatible gateway.
 QQ_API_BASE=https://api.sgroup.qq.com
 QQ_TOKEN_URL=https://bots.qq.com/app/getAppAccessToken
+
+# OpenAI-compatible Chat Completions settings.
+LLM_API_KEY=
+LLM_CHAT_COMPLETIONS_URL=https://api.deepseek.com/chat/completions
+LLM_MODEL=deepseek-chat
+
+# Exa Search API credential.
+EXA_API_KEY=
+
+# Optional runtime settings.
+VISION_ENABLED=true
+CONTEXT_MESSAGE_LIMIT=50
+MESSAGE_RETENTION_LIMIT=5000

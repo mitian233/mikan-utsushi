@@ -58,4 +58,6 @@ EXA_API_KEY
 - `docs/PRD.md`
 - `docs/superpowers/specs/2026-09-15-qq-companion-runtime-design.md`
 - `docs/superpowers/plans/2026-09-15-qq-companion-runtime.md`
+- `docs/architecture.md`
 - `docs/project-analysis.md`
+- `docs/acceptance-report.md`

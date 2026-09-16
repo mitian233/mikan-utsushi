@@ -136,6 +136,9 @@ importers:
       '@mikan-utsushi/qqbot':
         specifier: workspace:*
         version: link:../../packages/qqbot
+      '@mikan-utsushi/web-tools':
+        specifier: workspace:*
+        version: link:../../packages/web-tools
       agents:
         specifier: 0.23.0
         version: 0.23.0(@babel/core@8.0.5)(@babel/runtime@7.29.7)(@modelcontextprotocol/client@2.0.0)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(supports-color@10.2.2)(zod@4.4.3))(@modelcontextprotocol/server@2.0.0)(rolldown@1.2.8)(vite@8.3.0(esbuild@0.28.2)(yaml@2.9.1))(zod@4.4.3)

@@ -1,10 +1,11 @@
 import type { ChatMessage } from "@mikan-utsushi/contracts";
-import { OpenAICompatibleClient, type ModelToolCall } from "@mikan-utsushi/model-provider";
+import { OpenAICompatibleClient } from "@mikan-utsushi/model-provider";
 import { Agent } from "agents";
 import { SYSTEM_PROMPT } from "../prompts";
 import { parseRuntimeConfig, type Env, type RuntimeConfig } from "../env";
 import { buildInitialModelMessages, type ContextMessage } from "./context";
 import { runToolLoop, type ToolRuntime } from "./turn-runner";
+import { MEMORY_TOOL_DEFINITIONS, MemoryToolRuntime, WEB_TOOL_DEFINITIONS } from "./tool-runtime";
 import { SCHEMA_STATEMENTS } from "./schema";
 
 const DEBOUNCE_SECONDS = 2;
@@ -255,11 +256,11 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       recentVisibleMessages,
     });
     const client = this.createModelClient(runtimeConfig);
-    const runtime = this.createToolRuntime();
+    const runtime = this.createToolRuntime(runtimeConfig);
     const result = await runToolLoop({
       client,
       messages,
-      tools: [],
+      tools: [...MEMORY_TOOL_DEFINITIONS, ...WEB_TOOL_DEFINITIONS],
       runtime,
       context: {
         turnId,
@@ -281,16 +282,10 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
     });
   }
 
-  protected createToolRuntime(): ToolRuntime {
-    return {
-      execute: async (call: ModelToolCall) => ({
-        content: JSON.stringify({
-          error: "Unknown tool",
-          name: call.function.name,
-        }),
-        sentCount: 0,
-      }),
-    };
+  protected createToolRuntime(config?: RuntimeConfig): ToolRuntime {
+    return new MemoryToolRuntime(this.ctx.storage.sql, {
+      exaApiKey: config?.exaApiKey,
+    });
   }
 
   private turnHasSent(turnId: string): boolean {

@@ -12,6 +12,7 @@
     "@mikan-utsushi/contracts": "workspace:*",
     "@mikan-utsushi/model-provider": "workspace:*",
     "@mikan-utsushi/qqbot": "workspace:*",
+    "@mikan-utsushi/web-tools": "workspace:*",
     "agents": "0.23.0"
   }
 }

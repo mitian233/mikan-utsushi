@@ -28,6 +28,7 @@
 
 - 新功能和 bug 修复必须先写失败测试，再实现最小代码；测试必须先观察到预期失败。
 - Workers 相关测试使用 Cloudflare Workers 测试池；`HTMLRewriter`、SDK 兼容性、AbortSignal、超时和错误行为不能只用 Node 测试验证。
+- 审计/门禁 agent 可以读取代码、审计 diff，并运行测试、typecheck、`wrangler` dry-run 和其他非破坏性验证；必须记录准确命令、结果和阻塞原因。发现问题时回报主线安排修复，不自行修改源码、提交、部署或写入凭据。
 - 完成前至少运行受影响包的 typecheck/test；涉及全局配置或依赖时运行：
   - `pnpm typecheck`
   - `pnpm test`

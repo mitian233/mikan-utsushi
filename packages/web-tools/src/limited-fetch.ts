@@ -84,7 +84,7 @@ export async function fetchReadableResource(input: {
   maxBytes?: number;
   maxRedirects?: number;
 }): Promise<{ finalUrl: string; contentType: string; body: Uint8Array }> {
-  const fetchFn = input.fetchFn ?? globalThis.fetch;
+  const fetchFn = input.fetchFn ?? globalThis.fetch.bind(globalThis);
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
   const maxRedirects = input.maxRedirects ?? DEFAULT_MAX_REDIRECTS;

@@ -15,6 +15,21 @@ const results = Array.from({ length: 6 }, (_, index) => ({
 }));
 
 describe("ExaSearchClient", () => {
+  it("binds the Workers global fetch when no fetchFn is injected", async () => {
+    const runtimeFetch = function (this: unknown, _input: RequestInfo | URL, _init?: RequestInit): Promise<Response> {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      return Promise.resolve(exaResponse({ results: [{ title: "Default", url: "https://example.com/default" }] }));
+    };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = runtimeFetch;
+    try {
+      await expect(new ExaSearchClient({ apiKey: "exa-secret" }).search("query"))
+        .resolves.toEqual([{ title: "Default", url: "https://example.com/default" }]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("sends the exact direct REST request and maps the first highlight", async () => {
     let request: Request | undefined;
     const client = new ExaSearchClient({

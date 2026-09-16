@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   OpenAICompatibleClient,
   type ModelMessage,
@@ -48,6 +48,26 @@ function assistantResponse(overrides: Record<string, unknown> = {}) {
 }
 
 describe("OpenAICompatibleClient", () => {
+  it("binds the Workers global fetch on the direct-fetch path", async () => {
+    const runtimeFetch = function (this: unknown, _input: RequestInfo | URL, _init?: RequestInit): Promise<Response> {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      return Promise.resolve(completionResponse(assistantResponse()));
+    };
+    vi.stubGlobal("fetch", runtimeFetch);
+    try {
+      const client = new OpenAICompatibleClient({
+        url: "https://gateway.example/custom/chat",
+        apiKey: "secret",
+        model: "compatible-model",
+      });
+
+      await expect(client.complete({ messages, tools }, new AbortController().signal))
+        .resolves.toMatchObject({ message: { content: "The weather is sunny." } });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("sends the exact configured URL, auth, body, and maps assistant content and usage", async () => {
     let request: Request | undefined;
     const fetchFn = async (input: RequestInfo | URL, init?: RequestInit) => {

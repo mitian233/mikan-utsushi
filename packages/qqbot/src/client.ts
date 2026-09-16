@@ -23,7 +23,7 @@ export class QQBotClient {
   private cachedToken: CachedToken | undefined;
 
   constructor(private readonly options: QQBotClientOptions) {
-    this.fetchFn = options.fetchFn ?? fetch;
+    this.fetchFn = options.fetchFn ?? globalThis.fetch.bind(globalThis);
     this.apiBase = (options.apiBase ?? DEFAULT_API_BASE).replace(/\/$/, "");
     this.tokenUrl = options.tokenUrl ?? DEFAULT_TOKEN_URL;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;

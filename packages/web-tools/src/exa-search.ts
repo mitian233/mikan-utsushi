@@ -51,7 +51,7 @@ export class ExaSearchClient {
 
   constructor(options: { apiKey: string; fetchFn?: FetchFn }) {
     this.apiKey = options.apiKey;
-    this.fetchFn = options.fetchFn ?? fetch;
+    this.fetchFn = options.fetchFn ?? globalThis.fetch.bind(globalThis);
   }
 
   async search(query: string, signal?: AbortSignal): Promise<SearchResult[]> {

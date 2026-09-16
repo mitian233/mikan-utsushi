@@ -27,6 +27,32 @@ function tokenResponse(): Response {
 }
 
 describe("QQBotClient", () => {
+  it("binds the Workers global fetch when no fetchFn is injected", async () => {
+    const calls: Array<{ input: RequestInfo | URL; init?: RequestInit }> = [];
+    const runtimeFetch = function (this: unknown, input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      calls.push({ input, init });
+      return Promise.resolve(calls.length === 1
+        ? tokenResponse()
+        : Response.json({ id: "qq-message-default-fetch" }));
+    };
+    vi.stubGlobal("fetch", runtimeFetch);
+    try {
+      const client = new QQBotClient({
+        appId: "app-id",
+        appSecret: "app-secret",
+        apiBase: "https://api.example.test",
+        tokenUrl: "https://token.example.test",
+      });
+
+      await expect(client.sendText({ scope: "group", targetId: "group-1" }, "hello"))
+        .resolves.toEqual({ outcome: "sent", messageId: "qq-message-default-fetch" });
+      expect(calls).toHaveLength(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("sends group text with msg_type and optional reply id", async () => {
     const { client, requests } = clientWith([
       tokenResponse(),

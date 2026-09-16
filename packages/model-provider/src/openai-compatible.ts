@@ -185,7 +185,7 @@ export class OpenAICompatibleClient {
     this.url = options.url;
     this.apiKey = options.apiKey;
     this.model = options.model;
-    this.fetchFn = options.fetchFn ?? fetch;
+    this.fetchFn = options.fetchFn ?? globalThis.fetch.bind(globalThis);
 
     const baseURL = sdkBaseUrl(options.url);
     this.sdk = baseURL

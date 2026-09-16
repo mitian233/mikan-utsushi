@@ -6,6 +6,20 @@ const htmlResponse = (body: string, headers: Record<string, string> = {}) =>
   new Response(body, { status: 200, headers: { "content-type": "text/html; charset=utf-8", ...headers } });
 
 describe("restricted readable fetch", () => {
+  it("binds the Workers global fetch when no fetchFn is injected", async () => {
+    const runtimeFetch = function (this: unknown, _input: RequestInfo | URL, _init?: RequestInit): Promise<Response> {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      return Promise.resolve(htmlResponse("default fetch"));
+    };
+    vi.stubGlobal("fetch", runtimeFetch);
+    try {
+      const result = await fetchReadableResource({ url: "https://example.com/start", resolver: publicResolver });
+      expect(new TextDecoder().decode(result.body)).toBe("default fetch");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("allows at most three validated redirects and resolves relative locations", async () => {
     const fetchFn = vi.fn()
       .mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: "/one" } }))

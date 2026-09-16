@@ -11,6 +11,6 @@
   "dependencies": {
     "@mikan-utsushi/contracts": "workspace:*",
     "@mikan-utsushi/qqbot": "workspace:*",
-    "agents": "latest"
+    "agents": "0.23.0"
   }
 }

@@ -1,3 +1,10 @@
 packages:
   - apps/*
   - packages/*
+
+# pnpm 12 blocks lifecycle scripts by default. These packages need theirs to
+# place native binaries (workerd runtime, esbuild). Everything else is ignored.
+allowBuilds:
+  core-js-pure: false
+  esbuild: true
+  workerd: true

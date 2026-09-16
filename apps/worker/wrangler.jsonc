@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "mikan-utsushi",
   "main": "src/index.ts",
-  "compatibility_date": "2026-09-15",
+  "compatibility_date": "2026-08-22",
   "durable_objects": {
     "bindings": [
       {

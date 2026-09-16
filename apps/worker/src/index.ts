@@ -106,7 +106,9 @@ function isWebhookPayload(value: unknown): value is QQWebhookPayload {
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function stringValue(value: unknown): string | undefined {

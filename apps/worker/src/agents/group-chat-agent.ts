@@ -39,9 +39,10 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
     if (!scheduled) {
       await this.ctx.storage.put("processor_scheduled", true);
       try {
-        await this.schedule(DEBOUNCE_SECONDS, "processPending", {});
+        await this.schedule(DEBOUNCE_SECONDS, "flushPending", {});
       } catch (error) {
         await this.ctx.storage.delete("processor_scheduled");
+        this.ctx.storage.sql.exec("DELETE FROM messages WHERE event_id = ?", message.eventId);
         throw error;
       }
     }
@@ -49,7 +50,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
     return { accepted: true, duplicate: false };
   }
 
-  async processPending(): Promise<void> {
+  async flushPending(): Promise<void> {
     this.ensureSchema();
     await this.ctx.storage.put("processor_scheduled", false);
 

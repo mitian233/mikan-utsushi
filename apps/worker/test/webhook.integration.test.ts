@@ -1,5 +1,6 @@
 import { env, listDurableObjectIds, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ChatMessage } from "@mikan-utsushi/contracts";
 import worker from "../src/index";
 import type { Env } from "../src/env";
 
@@ -28,6 +29,21 @@ function groupPayload(eventId = "event-group-1"): Payload {
       timestamp: "2026-09-15T00:00:00.000Z",
       author: { member_openid: "member-openid-1", username: "Mikan" },
     },
+  };
+}
+
+function normalizedGroupMessage(eventId: string): ChatMessage {
+  return {
+    platform: "qq",
+    eventId,
+    messageId: `message-${eventId}`,
+    chatId: "schedule-retry-group",
+    chatKind: "group",
+    userId: "schedule-retry-member",
+    username: "Mikan",
+    text: "hello",
+    images: [],
+    timestamp: Date.parse("2026-09-15T00:00:00.000Z"),
   };
 }
 
@@ -110,16 +126,24 @@ describe("QQ webhook integration", () => {
   it("ACKs valid unsupported events without calling the Agent", async () => {
     const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
     const before = (await listDurableObjectIds(namespace)).map((id) => id.toString()).sort();
-    expect(
-      (
-        await sendWebhook({ id: "ready-event", op: 0, t: "READY", d: {} })
-      ).status,
-    ).toBe(200);
+    const response = await sendWebhook({ id: "ready-event", op: 0, t: "READY", d: {} });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ op: 12, d: 0 });
     const after = (await listDurableObjectIds(namespace)).map((id) => id.toString()).sort();
     expect(after).toEqual(before);
   });
 
   it("returns 400 for empty, malformed, or structurally invalid payloads", async () => {
+    const empty = await worker.fetch(
+      new Request("https://worker.test/webhooks/qq", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "",
+      }),
+      workerEnv,
+    );
+    expect(empty.status).toBe(400);
+
     const malformed = await worker.fetch(
       new Request("https://worker.test/webhooks/qq", {
         method: "POST",
@@ -130,8 +154,49 @@ describe("QQ webhook integration", () => {
     );
     expect(malformed.status).toBe(400);
 
-    const invalidShape = await sendWebhook({ op: 0, t: "MESSAGE_CREATE", d: null });
-    expect(invalidShape.status).toBe(400);
+    const invalidObject = await sendWebhook({ op: 0, t: "MESSAGE_CREATE", d: null });
+    expect(invalidObject.status).toBe(400);
+
+    const invalidArray = await sendWebhook({ op: 0, t: "MESSAGE_CREATE", d: [] });
+    expect(invalidArray.status).toBe(400);
+  });
+
+  it("rolls back a newly inserted event when scheduling fails so a retry can schedule it", async () => {
+    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+    const stub = namespace.get(namespace.idFromName("qq:group:schedule-retry-group"));
+    const outcome = await runInDurableObject(stub, async (instance, state) => {
+      const agent = instance as unknown as {
+        receiveMessage(message: ChatMessage): Promise<{ accepted: true; duplicate: boolean }>;
+        schedule(...args: unknown[]): Promise<unknown>;
+      };
+      const scheduleCalls: unknown[][] = [];
+      const originalSchedule = agent.schedule.bind(instance);
+      agent.schedule = async (...args: unknown[]) => {
+        scheduleCalls.push(args);
+        if (scheduleCalls.length === 1) throw new Error("scheduler unavailable");
+        return originalSchedule(...args);
+      };
+      const message = normalizedGroupMessage("schedule-retry-event");
+
+      await expect(agent.receiveMessage(message)).rejects.toThrow("scheduler unavailable");
+      const rowsAfterFailure = state.storage.sql
+        .exec<{ event_id: string }>("SELECT event_id FROM messages WHERE event_id = ?", message.eventId)
+        .toArray();
+      const retry = await agent.receiveMessage(message);
+      const rowsAfterRetry = state.storage.sql
+        .exec<{ event_id: string }>("SELECT event_id FROM messages WHERE event_id = ?", message.eventId)
+        .toArray();
+
+      return { retry, rowsAfterFailure, rowsAfterRetry, scheduleCalls };
+    });
+
+    expect(outcome.rowsAfterFailure).toEqual([]);
+    expect(outcome.retry).toEqual({ accepted: true, duplicate: false });
+    expect(outcome.rowsAfterRetry).toEqual([{ event_id: "schedule-retry-event" }]);
+    expect(outcome.scheduleCalls).toEqual([
+      [2, "flushPending", {}],
+      [2, "flushPending", {}],
+    ]);
   });
 
   it("returns 503 when Agent persistence fails", async () => {

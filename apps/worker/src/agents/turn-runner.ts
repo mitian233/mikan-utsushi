@@ -9,6 +9,8 @@ import type {
 export interface ToolExecutionContext {
   turnId: string;
   speakerId?: string;
+  chatKind?: "group" | "c2c";
+  chatId?: string;
   signal: AbortSignal;
 }
 
@@ -22,9 +24,18 @@ export interface ToolRuntime {
   execute(call: ModelToolCall, context: ToolExecutionContext): Promise<ToolExecutionResult>;
 }
 
+export type ToolCallAuditEvent = {
+  call: ModelToolCall;
+  status: "running" | "completed" | "failed";
+  result?: ToolExecutionResult;
+  error?: unknown;
+};
+
 export interface TurnRunnerContext {
   turnId: string;
   speakerId?: string;
+  chatKind?: "group" | "c2c";
+  chatId?: string;
   signal?: AbortSignal;
 }
 
@@ -54,6 +65,7 @@ export async function runToolLoop(input: {
   runtime: ToolRuntime;
   context: TurnRunnerContext;
   timeoutMs?: number;
+  onToolCall?: (event: ToolCallAuditEvent) => void | Promise<void>;
 }): Promise<ToolLoopResult> {
   const timeoutMs = input.timeoutMs ?? 120_000;
   const controller = new AbortController();
@@ -65,6 +77,8 @@ export async function runToolLoop(input: {
   const context: ToolExecutionContext = {
     turnId: input.context.turnId,
     speakerId: input.context.speakerId,
+    chatKind: input.context.chatKind,
+    chatId: input.context.chatId,
     signal: controller.signal,
   };
   const messages = [...input.messages];
@@ -84,12 +98,19 @@ export async function runToolLoop(input: {
       if (toolCalls.length === 0) return { sentCount, usage };
 
       for (const call of toolCalls) {
+        await input.onToolCall?.({ call, status: "running" });
         let result: ToolExecutionResult;
+        let executionFailed = false;
         try {
           result = await input.runtime.execute(call, context);
         } catch (error) {
+          executionFailed = true;
+          await input.onToolCall?.({ call, status: "failed", error });
           if (controller.signal.aborted) throw error;
           result = errorResult(error);
+        }
+        if (!executionFailed) {
+          await input.onToolCall?.({ call, status: "completed", result });
         }
         sentCount += result.sentCount ?? (result.hasSent ? 1 : 0);
         messages.push({ role: "tool", tool_call_id: call.id, content: result.content });

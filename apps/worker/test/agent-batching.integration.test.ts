@@ -46,6 +46,61 @@ afterEach(async () => {
 });
 
 describe("GroupChatAgent batching and retries", () => {
+  it("rejects a message from a different conversation identity in the same Agent", async () => {
+    await withAgent(async (agent) => {
+      agent.schedule = async () => undefined;
+      await expect(agent.receiveMessage(message("identity-first"))).resolves.toMatchObject({ accepted: true });
+      await expect(agent.receiveMessage({
+        ...message("identity-second"),
+        chatKind: "c2c",
+        chatId: "different-user",
+        userId: "different-user",
+      })).rejects.toThrow("Conversation identity mismatch");
+    });
+  });
+
+  it("rejects a first message whose payload does not match the fixed Agent identity", async () => {
+    const stub = namespace.get(namespace.idFromName("qq:group:fixed-group"));
+    const result = await runInDurableObject(stub, async (instance, state) => {
+      const agent = instance as unknown as TestAgent;
+      agent.schedule = async () => undefined;
+      await expect(agent.receiveMessage({
+        ...message("wrong-first"),
+        chatId: "attacker-group",
+      })).rejects.toThrow("Conversation identity mismatch");
+      return {
+        messages: rows<{ event_id: string }>(state, "SELECT event_id FROM messages"),
+        identity: await state.storage.get("conversation_identity"),
+      };
+    });
+
+    expect(result.messages).toEqual([]);
+    expect(result.identity).toBeUndefined();
+  });
+
+  it("accepts a first message matching a fixed C2C Agent identity", async () => {
+    const stub = namespace.get(namespace.idFromName("qq:c2c:fixed-user"));
+    const result = await runInDurableObject(stub, async (instance, state) => {
+      const agent = instance as unknown as TestAgent;
+      agent.schedule = async () => undefined;
+      const accepted = await agent.receiveMessage({
+        ...message("c2c-first"),
+        chatKind: "c2c",
+        chatId: "fixed-user",
+        userId: "fixed-user",
+      });
+      return {
+        accepted,
+        messages: rows<{ chat_kind: string; chat_id: string }>(state, "SELECT chat_kind, chat_id FROM messages"),
+        identity: await state.storage.get("conversation_identity"),
+      };
+    });
+
+    expect(result.accepted).toEqual({ accepted: true, duplicate: false });
+    expect(result.messages).toEqual([{ chat_kind: "c2c", chat_id: "fixed-user" }]);
+    expect(result.identity).toEqual({ chatKind: "c2c", chatId: "fixed-user" });
+  });
+
   it("uses the fixed retry schedule", () => {
     expect(retryDelaySeconds(1)).toBe(5);
     expect(retryDelaySeconds(2)).toBe(30);
@@ -289,6 +344,36 @@ describe("GroupChatAgent batching and retries", () => {
       await firstRun;
       expect(active).toBe(0);
     });
+  });
+
+  it("retains only the newest visible chat rows after completion", async () => {
+    const result = await withAgent(async (agent, state) => {
+      agent.schedule = async () => undefined;
+      agent.getRuntimeConfig = () => ({
+        messageRetentionLimit: 2,
+      }) as never;
+      await seedMessage(agent, message("message-1"));
+      await agent.flushPending();
+      const turnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
+      state.storage.sql.exec(
+        `INSERT INTO messages
+         (event_id, message_id, direction, chat_kind, chat_id, user_id, text, images_json, status, created_at)
+         VALUES ('old-event', 'old-message', 'inbound', 'group', 'batching-group', 'member-1', 'old', '[]', 'visible', 1),
+                ('new-event', 'new-message', 'outbound', 'group', 'batching-group', NULL, 'new', '[]', 'visible', 2)`,
+      );
+      agent.executeTurn = async () => ({ hasSent: false });
+      await agent.runTurn({ turnId });
+      return {
+        messages: rows<{ message_id: string; status: string }>(state, "SELECT message_id, status FROM messages ORDER BY created_at, id"),
+        turns: rows<{ id: string }>(state, "SELECT id FROM turns"),
+      };
+    });
+
+    expect(result.messages).toEqual([
+      { message_id: "new-message", status: "visible" },
+      { message_id: "message-message-1", status: "visible" },
+    ]);
+    expect(result.turns).toHaveLength(1);
   });
 
   it("re-establishes a flush schedule after runTurn scheduling fails", async () => {

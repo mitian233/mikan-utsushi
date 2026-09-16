@@ -2,6 +2,7 @@ import { env, listDurableObjectIds, reset, runInDurableObject } from "cloudflare
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ChatMessage } from "@mikan-utsushi/contracts";
 import worker from "../src/index";
+import { MemoryToolRuntime } from "../src/agents/tool-runtime";
 import type { Env } from "../src/env";
 
 vi.mock("@mikan-utsushi/qqbot", async () => {
@@ -28,6 +29,19 @@ function groupPayload(eventId = "event-group-1"): Payload {
       content: "hello",
       timestamp: "2026-09-15T00:00:00.000Z",
       author: { member_openid: "member-openid-1", username: "Mikan" },
+    },
+  };
+}
+
+function c2cPayload(eventId = "event-c2c-1"): Payload {
+  return {
+    id: eventId,
+    op: 0,
+    t: "C2C_MESSAGE_CREATE",
+    d: {
+      id: `message-${eventId}`,
+      content: "hello c2c",
+      author: { user_openid: "user-openid-1" },
     },
   };
 }
@@ -88,6 +102,164 @@ describe("QQ webhook integration", () => {
       chat_kind: "group",
       status: "pending",
     });
+  });
+
+  it("runs a webhook-created group message through batching and one durable delivery", async () => {
+    expect((await sendWebhook(groupPayload("e2e-group-event"))).status).toBe(200);
+    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+    const stub = namespace.get(namespace.idFromName("qq:group:group-openid-1"));
+    const observed = await runInDurableObject(stub, async (instance, state) => {
+      const agent = instance as unknown as {
+        schedule(...args: unknown[]): Promise<unknown>;
+        flushPending(): Promise<void>;
+        runTurn(payload: { turnId: string }): Promise<void>;
+        getRuntimeConfig(): Record<string, unknown>;
+        createModelClient(config: unknown): unknown;
+        createToolRuntime(config?: unknown): MemoryToolRuntime;
+      };
+      agent.schedule = async () => undefined;
+      agent.getRuntimeConfig = () => ({
+        qqAppId: "app-id",
+        qqAppSecret: "app-secret",
+        qqApiBase: "https://qq.example.test",
+        qqTokenUrl: "https://token.example.test",
+        llmUrl: "https://llm.example.test/chat/completions",
+        llmApiKey: "llm-key",
+        model: "test-model",
+        exaApiKey: "exa-key",
+        visionEnabled: true,
+        contextMessageLimit: 50,
+        messageRetentionLimit: 50,
+      });
+      let completionCount = 0;
+      agent.createModelClient = () => ({
+        complete: async () => {
+          completionCount += 1;
+          return completionCount === 1
+            ? {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  toolCalls: [{
+                    id: "e2e-send-call",
+                    type: "function" as const,
+                    function: { name: "send_message", arguments: JSON.stringify({ content: "webhook reply" }) },
+                  }],
+                },
+                usage: { totalTokens: 1 },
+              }
+            : { message: { role: "assistant", content: "done", toolCalls: [] }, usage: { totalTokens: 1 } };
+        },
+      });
+      const sendText = vi.fn(async () => ({ outcome: "sent" as const, messageId: "e2e-qq-message" }));
+      agent.createToolRuntime = () => new MemoryToolRuntime(state.storage.sql, {
+        qqClient: { sendText },
+        transactionSync: <T>(closure: () => T) => closure(),
+      });
+
+      await agent.flushPending();
+      const turnId = state.storage.sql.exec<{ id: string }>("SELECT id FROM turns LIMIT 1").toArray()[0]?.id;
+      if (!turnId) throw new Error("missing webhook-created turn");
+      await agent.runTurn({ turnId });
+      return {
+        sendCalls: sendText.mock.calls.length,
+        deliveries: state.storage.sql.exec("SELECT tool_call_id, status FROM outbound_deliveries").toArray(),
+        messages: state.storage.sql.exec("SELECT direction, status, text FROM messages ORDER BY id").toArray(),
+      };
+    });
+
+    expect(observed.sendCalls).toBe(1);
+    expect(observed.deliveries).toEqual([{ tool_call_id: "e2e-send-call", status: "sent" }]);
+    expect(observed.messages).toEqual([
+      { direction: "inbound", status: "visible", text: "hello" },
+      { direction: "outbound", status: "visible", text: "webhook reply" },
+    ]);
+    expect((await sendWebhook(groupPayload("e2e-group-event"))).status).toBe(200);
+    const deliveriesAfterDuplicate = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec("SELECT tool_call_id, status FROM outbound_deliveries").toArray(),
+    );
+    expect(deliveriesAfterDuplicate).toEqual([{ tool_call_id: "e2e-send-call", status: "sent" }]);
+  });
+
+  it("runs a webhook-created C2C message through batching and one durable delivery", async () => {
+    expect((await sendWebhook(c2cPayload("e2e-c2c-event"))).status).toBe(200);
+    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+    const stub = namespace.get(namespace.idFromName("qq:c2c:user-openid-1"));
+    const observed = await runInDurableObject(stub, async (instance, state) => {
+      const agent = instance as unknown as {
+        schedule(...args: unknown[]): Promise<unknown>;
+        flushPending(): Promise<void>;
+        runTurn(payload: { turnId: string }): Promise<void>;
+        getRuntimeConfig(): Record<string, unknown>;
+        createModelClient(config: unknown): unknown;
+        createToolRuntime(config?: unknown): MemoryToolRuntime;
+      };
+      agent.schedule = async () => undefined;
+      agent.getRuntimeConfig = () => ({
+        qqAppId: "app-id",
+        qqAppSecret: "app-secret",
+        qqApiBase: "https://qq.example.test",
+        qqTokenUrl: "https://token.example.test",
+        llmUrl: "https://llm.example.test/chat/completions",
+        llmApiKey: "llm-key",
+        model: "test-model",
+        exaApiKey: "exa-key",
+        visionEnabled: false,
+        contextMessageLimit: 50,
+        messageRetentionLimit: 50,
+      });
+      let completionCount = 0;
+      agent.createModelClient = () => ({
+        complete: async () => {
+          completionCount += 1;
+          return completionCount === 1
+            ? {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  toolCalls: [{
+                    id: "e2e-c2c-send-call",
+                    type: "function" as const,
+                    function: { name: "send_message", arguments: JSON.stringify({ content: "c2c reply" }) },
+                  }],
+                },
+                usage: { totalTokens: 1 },
+              }
+            : { message: { role: "assistant", content: "done", toolCalls: [] }, usage: { totalTokens: 1 } };
+        },
+      });
+      const sendText = vi.fn(async (target: { scope: string; targetId: string }) => ({
+        outcome: "sent" as const,
+        messageId: `${target.scope}-${target.targetId}-message`,
+      }));
+      agent.createToolRuntime = () => new MemoryToolRuntime(state.storage.sql, {
+        qqClient: { sendText },
+        transactionSync: <T>(closure: () => T) => closure(),
+      });
+
+      await agent.flushPending();
+      const turnId = state.storage.sql.exec<{ id: string }>("SELECT id FROM turns LIMIT 1").toArray()[0]?.id;
+      if (!turnId) throw new Error("missing webhook-created C2C turn");
+      await agent.runTurn({ turnId });
+      return {
+        sendCalls: sendText.mock.calls,
+        deliveries: state.storage.sql.exec("SELECT tool_call_id, status FROM outbound_deliveries").toArray(),
+        messages: state.storage.sql.exec("SELECT direction, status, text FROM messages ORDER BY id").toArray(),
+      };
+    });
+
+    expect(observed.sendCalls).toHaveLength(1);
+    expect(observed.sendCalls[0]?.[0]).toEqual({ scope: "c2c", targetId: "user-openid-1" });
+    expect(observed.deliveries).toEqual([{ tool_call_id: "e2e-c2c-send-call", status: "sent" }]);
+    expect(observed.messages).toEqual([
+      { direction: "inbound", status: "visible", text: "hello c2c" },
+      { direction: "outbound", status: "visible", text: "c2c reply" },
+    ]);
+    expect((await sendWebhook(c2cPayload("e2e-c2c-event"))).status).toBe(200);
+    const deliveriesAfterDuplicate = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.sql.exec("SELECT tool_call_id, status FROM outbound_deliveries").toArray(),
+    );
+    expect(deliveriesAfterDuplicate).toEqual([{ tool_call_id: "e2e-c2c-send-call", status: "sent" }]);
   });
 
   it("uses isolated group and C2C Agent names", async () => {

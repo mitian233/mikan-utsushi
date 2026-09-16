@@ -5,5 +5,6 @@ export type {
   QQAccessTokenResponse,
   QQBotClientOptions,
   QQMessageTarget,
+  QQSendResult,
   QQWebhookPayload,
 } from "./types";

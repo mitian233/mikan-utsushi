@@ -12,12 +12,19 @@ export interface QQMessageTarget {
   replyTo?: string;
 }
 
+export type QQSendResult =
+  | { outcome: "sent"; messageId?: string }
+  | { outcome: "failed"; status: number }
+  | { outcome: "unknown"; reason: "timeout" | "transport" };
+
 export interface QQBotClientOptions {
   appId: string;
   appSecret: string;
   apiBase?: string;
   tokenUrl?: string;
   fetchFn?: typeof fetch;
+  requestTimeoutMs?: number;
+
 }
 
 export interface QQAccessTokenResponse {

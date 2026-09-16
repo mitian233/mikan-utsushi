@@ -1,11 +1,21 @@
 import type { ChatMessage } from "@mikan-utsushi/contracts";
 import { OpenAICompatibleClient } from "@mikan-utsushi/model-provider";
+import { QQBotClient } from "@mikan-utsushi/qqbot";
 import { Agent } from "agents";
 import { SYSTEM_PROMPT } from "../prompts";
 import { parseRuntimeConfig, type Env, type RuntimeConfig } from "../env";
 import { buildInitialModelMessages, type ContextMessage } from "./context";
-import { runToolLoop, type ToolRuntime } from "./turn-runner";
-import { MEMORY_TOOL_DEFINITIONS, MemoryToolRuntime, WEB_TOOL_DEFINITIONS } from "./tool-runtime";
+import { runToolLoop, type ToolCallAuditEvent, type ToolRuntime } from "./turn-runner";
+import {
+  MEMORY_TOOL_DEFINITIONS,
+  MemoryToolRuntime,
+  SEND_MESSAGE_TOOL_DEFINITION,
+  hashAuditIdentifier,
+  sanitizeAuditToolName,
+  summarizeToolArguments,
+  summarizeToolResult,
+  WEB_TOOL_DEFINITIONS,
+} from "./tool-runtime";
 import { SCHEMA_STATEMENTS } from "./schema";
 
 const DEBOUNCE_SECONDS = 2;
@@ -27,6 +37,15 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
 
   async receiveMessage(message: ChatMessage): Promise<{ accepted: true; duplicate: boolean }> {
     this.ensureSchema();
+    const agentIdentity = this.agentIdentity();
+    if (agentIdentity.chatKind !== message.chatKind || agentIdentity.chatId !== message.chatId) {
+      throw new Error("Conversation identity mismatch");
+    }
+    const existingIdentity = await this.ctx.storage.get<ConversationIdentity>(CONVERSATION_IDENTITY_KEY);
+    if (existingIdentity && (existingIdentity.chatKind !== agentIdentity.chatKind || existingIdentity.chatId !== agentIdentity.chatId)) {
+      throw new Error("Conversation identity mismatch");
+    }
+    if (!existingIdentity) await this.ctx.storage.put(CONVERSATION_IDENTITY_KEY, agentIdentity);
 
     const inserted = this.ctx.storage.sql.exec(
       `INSERT OR IGNORE INTO messages
@@ -211,6 +230,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       "UPDATE messages SET status = 'visible' WHERE turn_id = ? AND status = 'batched'",
       payload.turnId,
     );
+    this.cleanupVisibleMessages(this.retentionLimit());
   }
 
   async retryTurn(payload: { turnId: string }): Promise<void> {
@@ -249,6 +269,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       .reverse();
     const turnMessages = turnRows.map(toContextMessage);
     const recentVisibleMessages = recentRows.map(toContextMessage);
+    const conversationIdentity = this.agentIdentity();
     const messages = buildInitialModelMessages({
       systemPrompt: SYSTEM_PROMPT,
       runtimeConfig,
@@ -260,12 +281,15 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
     const result = await runToolLoop({
       client,
       messages,
-      tools: [...MEMORY_TOOL_DEFINITIONS, ...WEB_TOOL_DEFINITIONS],
+      tools: [...MEMORY_TOOL_DEFINITIONS, ...WEB_TOOL_DEFINITIONS, SEND_MESSAGE_TOOL_DEFINITION],
       runtime,
       context: {
         turnId,
         speakerId: turnMessages.find((message) => message.direction === "inbound")?.userId ?? undefined,
+        chatKind: conversationIdentity?.chatKind,
+        chatId: conversationIdentity?.chatId,
       },
+      onToolCall: (event) => this.persistToolCallAudit(turnId, event),
     });
     return { hasSent: result.sentCount > 0 };
   }
@@ -282,10 +306,77 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
     });
   }
 
+  private qqClient?: QQBotClient;
+
+  private async persistToolCallAudit(turnId: string, event: ToolCallAuditEvent): Promise<void> {
+    const [auditTurnId, auditCallId] = await Promise.all([
+      hashAuditIdentifier(turnId),
+      hashAuditIdentifier(event.call.id),
+    ]);
+    const auditToolName = sanitizeAuditToolName(event.call.function.name);
+    const resultJson = event.result
+      ? summarizeToolResult(auditToolName, event.result.content)
+      : summarizeToolResult(auditToolName, JSON.stringify({ error: errorMessage(event.error) }));
+    if (event.status === "running") {
+      this.ctx.storage.sql.exec(
+        `INSERT OR IGNORE INTO tool_calls
+         (turn_id, id, name, arguments_json, status, created_at)
+         VALUES (?, ?, ?, ?, 'running', ?)`,
+        auditTurnId,
+        auditCallId,
+        auditToolName,
+        summarizeToolArguments(auditToolName, event.call.function.arguments),
+        Date.now(),
+      );
+      return;
+    }
+    this.ctx.storage.sql.exec(
+      `UPDATE tool_calls
+       SET result_json = ?, status = ?, completed_at = ?
+       WHERE turn_id = ? AND id = ?`,
+      resultJson,
+      event.status,
+      Date.now(),
+      auditTurnId,
+      auditCallId,
+    );
+  }
+
   protected createToolRuntime(config?: RuntimeConfig): ToolRuntime {
+    if (config && !this.qqClient) {
+      this.qqClient = new QQBotClient({
+        appId: config.qqAppId,
+        appSecret: config.qqAppSecret,
+        apiBase: config.qqApiBase,
+        tokenUrl: config.qqTokenUrl,
+      });
+    }
     return new MemoryToolRuntime(this.ctx.storage.sql, {
       exaApiKey: config?.exaApiKey,
+      qqClient: this.qqClient,
+      transactionSync: (closure) => this.ctx.storage.transactionSync(closure),
     });
+  }
+
+  private retentionLimit(): number {
+    try {
+      return this.getRuntimeConfig().messageRetentionLimit;
+    } catch {
+      return 5000;
+    }
+  }
+
+  private cleanupVisibleMessages(limit: number): void {
+    this.ctx.storage.sql.exec(
+      `DELETE FROM messages
+       WHERE id IN (
+         SELECT id FROM messages
+         WHERE status = 'visible'
+         ORDER BY created_at DESC, id DESC
+         LIMIT -1 OFFSET ?
+       )`,
+      limit,
+    );
   }
 
   private turnHasSent(turnId: string): boolean {
@@ -337,7 +428,28 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       this.ctx.storage.sql.exec(statement);
     }
   }
+
+  private agentIdentity(): ConversationIdentity {
+    const name = this.ctx.id.name;
+    if (typeof name !== "string") throw new Error("Invalid QQ Agent identity");
+    const groupPrefix = "qq:group:";
+    const c2cPrefix = "qq:c2c:";
+    if (name.startsWith(groupPrefix) && name.length > groupPrefix.length) {
+      return { chatKind: "group", chatId: name.slice(groupPrefix.length) };
+    }
+    if (name.startsWith(c2cPrefix) && name.length > c2cPrefix.length) {
+      return { chatKind: "c2c", chatId: name.slice(c2cPrefix.length) };
+    }
+    throw new Error("Invalid QQ Agent identity");
+  }
 }
+
+const CONVERSATION_IDENTITY_KEY = "conversation_identity";
+
+type ConversationIdentity = {
+  chatKind: "group" | "c2c";
+  chatId: string;
+};
 
 interface StoredMessageRow extends Record<string, string | number | null> {
   id: number;

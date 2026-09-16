@@ -43,7 +43,7 @@ QQ 侧决定哪些事件会触发 Webhook。云端接受全部合法回调，对
 
 模型拥有是否发送消息的决定权。普通 assistant 文本不会自动发到 QQ，只有 `send_message` 工具会产生发送行为。提示词要求模型非必要不要把一条回复拆成多条，但允许接龙等自然需要连续发送的场景。
 
-历史上下文只包含聊天参与者实际可见的收发消息。内部工具调用、重试、错误和旧工具结果不进入后续聊天上下文。
+历史上下文只包含聊天参与者实际可见的收发消息。内部工具调用、重试、错误和旧工具结果不进入后续聊天上下文；工具调用仍会持久化到 Agent 私有 SQLite 的 `tool_calls` 审计表。
 
 ## 模型与图片
 
@@ -81,7 +81,7 @@ Memory 范围只有：
 
 ## 互联网能力
 
-`search_web` 使用 Exa Search API，密钥由 `EXA_API_KEY` 提供。
+`search_web` 使用项目自有 direct Worker `fetch` 调用 Exa Search API，密钥由 `EXA_API_KEY` 提供；不接入 Exa SDK，以保留取消和超时控制。
 
 `read_web` 使用 Worker 自己的只读 HTTP 获取器：
 
@@ -97,7 +97,7 @@ Memory 范围只有：
 
 ## 配置方式
 
-首版不提供管理后台。密钥使用 Cloudflare Secret，普通参数使用环境变量。人格、语气和聊天行为存放在：
+首版不提供 dashboard、管理后台或在线设置 API。`QQ_APP_ID`、`QQ_APP_SECRET`、`LLM_API_KEY`、`EXA_API_KEY` 使用 Wrangler Secret，普通参数使用环境变量。人格、语气和聊天行为存放在：
 
 ```text
 apps/worker/src/prompts/system-prompt.md
@@ -140,6 +140,7 @@ apps/worker/src/prompts/system-prompt.md
 7. 网页读取的 URL、重定向、超时、大小和类型限制通过测试。
 8. 已成功或结果未知的 QQ 发送不会被自动重复。
 9. TypeScript 检查、完整测试和 Wrangler 生产构建均成功。
+10. 群聊和 C2C 的端到端流程均验证 durable `send_message` 顺序、可见历史、失败重试和未知结果不重发。
 
 ## 相关文档
 

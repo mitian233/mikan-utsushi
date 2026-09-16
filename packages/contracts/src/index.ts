@@ -20,19 +20,3 @@ export interface ChatMessage {
   replyToMessageId?: string;
   timestamp: number;
 }
-
-export interface TextGenerationInput {
-  systemPrompt: string;
-  recentMessages: ChatMessage[];
-  pendingMessages: ChatMessage[];
-}
-
-export interface TextGenerationOutput {
-  text: string;
-  shouldReply: boolean;
-  memoryCandidates?: string[];
-}
-
-export interface ModelProvider {
-  generate(input: TextGenerationInput): Promise<TextGenerationOutput>;
-}

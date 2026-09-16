@@ -1,5 +1,8 @@
 export type {
-  ModelProvider,
-  TextGenerationInput,
-  TextGenerationOutput,
-} from "@mikan-utsushi/contracts";
+  ChatCompletionResult,
+  ModelContentPart,
+  ModelMessage,
+  ModelToolCall,
+  ModelToolDefinition,
+} from "./openai-compatible";
+export { ModelProviderAbortError, ModelProviderError, OpenAICompatibleClient } from "./openai-compatible";

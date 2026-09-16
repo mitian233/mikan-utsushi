@@ -108,8 +108,9 @@ export const SEND_MESSAGE_TOOL_DEFINITION: ModelToolDefinition = {
     parameters: {
       type: "object",
       additionalProperties: false,
-      required: ["content"],
+      required: ["action"],
       properties: {
+        action: { type: "string", enum: ["send", "silent"] },
         content: { type: "string" },
         reply_to_message_id: { type: "string" },
       },
@@ -199,9 +200,11 @@ function optionalScope(args: Record<string, unknown>): MemoryScope {
   return value;
 }
 
-function isAcceptedDelivery(value: unknown): value is { outcome: "sent" | "unknown" } {
+function isAcceptedDelivery(value: unknown): value is { outcome: "sent" | "unknown" | "silent" } {
   return typeof value === "object" && value !== null &&
-    ((value as { outcome?: unknown }).outcome === "sent" || (value as { outcome?: unknown }).outcome === "unknown");
+    ((value as { outcome?: unknown }).outcome === "sent" ||
+      (value as { outcome?: unknown }).outcome === "unknown" ||
+      (value as { outcome?: unknown }).outcome === "silent");
 }
 
 const MAX_AUDIT_FIELD_LENGTH = 1_000;
@@ -238,7 +241,7 @@ const AUDIT_ARGUMENT_KEYS: Record<string, readonly string[]> = {
   memory_delete: ["id"],
   search_web: ["query"],
   read_web: ["url"],
-  send_message: ["content", "reply_to_message_id"],
+  send_message: ["action", "content", "reply_to_message_id"],
 };
 
 function argumentShape(name: string, args: AuditShape): AuditShape {
@@ -366,8 +369,17 @@ export class MemoryToolRuntime implements ToolRuntime {
     try {
       const args = parseArguments(call);
       const result = await this.executeToolCall(call.function.name, args, context, call.id);
-      const sentCount = call.function.name === "send_message" && isAcceptedDelivery(result) ? 1 : 0;
-      return { content: JSON.stringify(result), sentCount };
+      const isTerminal = call.function.name === "send_message" && isAcceptedDelivery(result);
+      const sentCount = isTerminal && (result as { outcome: string }).outcome === "sent" ? 1 : 0;
+      const termination = isTerminal
+        ? ((result as { outcome: string }).outcome === "silent" ? "silent" : "sent")
+        : undefined;
+      return {
+        content: JSON.stringify(result),
+        sentCount,
+        terminal: isTerminal,
+        termination,
+      };
     } catch (error) {
       return {
         content: JSON.stringify({ error: error instanceof Error ? error.message : String(error) }),
@@ -414,6 +426,9 @@ export class MemoryToolRuntime implements ToolRuntime {
   }
 
   private async sendMessage(args: Record<string, unknown>, context: ToolExecutionContext, toolCallId: string): Promise<QQSendResult> {
+    const action = requiredString(args, "action");
+    if (action !== "send" && action !== "silent") throw new Error("action must be send or silent");
+    if (action === "silent") return { outcome: "silent" } as QQSendResult;
     if (!this.qqClient) throw new Error("send_message is unavailable");
     if (!context.chatKind || !context.chatId) throw new Error("Current QQ conversation is unavailable");
     const content = requiredString(args, "content");

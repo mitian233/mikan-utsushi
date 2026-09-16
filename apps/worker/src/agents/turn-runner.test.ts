@@ -99,12 +99,18 @@ describe("buildInitialModelMessages", () => {
 });
 
 describe("runToolLoop", () => {
-  it("executes unlimited tool calls in order and appends matching tool results", async () => {
+  it("executes work tools and requires a terminal message tool", async () => {
     const inputs: Array<{ messages: ModelMessage[]; signal: AbortSignal }> = [];
     const responses = [
-      completion(null, [toolCall("call-1", "one"), toolCall("call-2", "two")], 2),
+      completion(null, [toolCall("call-1", "one")], 2),
       completion(null, [toolCall("call-3", "three")], 3),
-      completion("ordinary assistant text", [], 4),
+      completion(null, [
+        {
+          id: "message-1",
+          type: "function",
+          function: { name: "send_message", arguments: JSON.stringify({ action: "silent" }) },
+        },
+      ], 4),
     ];
     const client = {
       complete: async (input: { messages: ModelMessage[]; tools: ModelToolDefinition[] }, signal: AbortSignal) => {
@@ -116,7 +122,12 @@ describe("runToolLoop", () => {
     const runtime: ToolRuntime = {
       execute: async (call, context) => {
         executions.push({ id: call.id, signal: context.signal });
-        return { content: `result-${call.id}`, sentCount: 0 };
+        return {
+          content: call.function.name === "send_message" ? JSON.stringify({ outcome: "silent" }) : `result-${call.id}`,
+          sentCount: 0,
+          terminal: call.function.name === "send_message",
+          termination: call.function.name === "send_message" ? "silent" : undefined,
+        };
       },
     };
 
@@ -128,20 +139,40 @@ describe("runToolLoop", () => {
       context: { turnId: "turn-1", speakerId: "member-1" },
     });
 
-    expect(executions.map((item) => item.id)).toEqual(["call-1", "call-2", "call-3"]);
+    expect(executions.map((item) => item.id)).toEqual(["call-1", "call-3", "message-1"]);
     expect(inputs).toHaveLength(3);
     expect(inputs[1]?.messages).toContainEqual({
       role: "assistant",
       content: null,
-      tool_calls: [toolCall("call-1", "one"), toolCall("call-2", "two")],
+      tool_calls: [toolCall("call-1", "one")],
     });
     expect(inputs[1]?.messages).toContainEqual({ role: "tool", tool_call_id: "call-1", content: "result-call-1" });
-    expect(inputs[1]?.messages).toContainEqual({ role: "tool", tool_call_id: "call-2", content: "result-call-2" });
     expect(inputs[2]?.messages).toContainEqual({ role: "tool", tool_call_id: "call-3", content: "result-call-3" });
-    expect(result).toEqual({ sentCount: 0, usage: [{ totalTokens: 2 }, { totalTokens: 3 }, { totalTokens: 4 }] });
+    expect(result).toEqual({ sentCount: 0, termination: "silent", usage: [{ totalTokens: 2 }, { totalTokens: 3 }, { totalTokens: 4 }] });
     expect(new Set(executions.map((item) => item.signal)).size).toBe(1);
     expect(new Set(inputs.map((item) => item.signal)).size).toBe(1);
     expect(inputs[0]?.signal).toBe(executions[0]?.signal);
+  });
+
+  it("does not finish on ordinary assistant text and asks for the terminal tool", async () => {
+    const inputs: ModelMessage[][] = [];
+    const client = {
+      complete: async (input: { messages: ModelMessage[]; tools: ModelToolDefinition[] }) => {
+        inputs.push(structuredClone(input.messages));
+        return inputs.length === 1
+          ? completion("I should answer directly")
+          : completion(null, [{
+              id: "silent-1",
+              type: "function",
+              function: { name: "send_message", arguments: JSON.stringify({ action: "silent" }) },
+            }]);
+      },
+    };
+    const runtime: ToolRuntime = { execute: async () => ({ content: JSON.stringify({ outcome: "silent" }), terminal: true, termination: "silent" }) };
+
+    await expect(runToolLoop({ client, messages: [], tools: [tool], runtime, context: { turnId: "turn-required" } }))
+      .resolves.toMatchObject({ termination: "silent" });
+    expect(inputs[1]).toContainEqual({ role: "user", content: "The previous response did not call the terminal send_message tool. Call send_message with action=send or action=silent to finish this turn; do not answer with plain text." });
   });
 
   it("uses one shared 120-second deadline for model and tool work", async () => {

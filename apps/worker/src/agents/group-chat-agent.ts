@@ -28,6 +28,7 @@ const SERIALIZATION_RETRY_SECONDS = 1;
 
 export type TurnExecutionResult = {
   hasSent: boolean;
+  termination?: "sent" | "silent";
   error?: unknown;
 };
 
@@ -225,10 +226,11 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
 
     this.ctx.storage.sql.exec(
       `UPDATE turns
-       SET status = 'completed', completed_at = ?,
+       SET status = 'completed', completed_at = ?, terminal = 1, termination = ?,
            has_sent = CASE WHEN has_sent = 1 OR ? = 1 THEN 1 ELSE 0 END
        WHERE id = ?`,
       Date.now(),
+      outcome.termination ?? "sent",
       outcome.hasSent ? 1 : 0,
       payload.turnId,
     );
@@ -298,7 +300,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       onToolCall: (event) => this.persistToolCallAudit(turnId, event),
       onDebug: (event) => this.persistTurnDebug(turnId, event),
     });
-    return { hasSent: result.sentCount > 0 };
+    return { hasSent: result.sentCount > 0, termination: result.termination };
   }
 
   protected getRuntimeConfig(): RuntimeConfig {
@@ -487,6 +489,9 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
     for (const statement of SCHEMA_STATEMENTS) {
       this.ctx.storage.sql.exec(statement);
     }
+    // Existing Durable Objects need the new terminal outcome columns too.
+    try { this.ctx.storage.sql.exec("ALTER TABLE turns ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0"); } catch { /* already migrated */ }
+    try { this.ctx.storage.sql.exec("ALTER TABLE turns ADD COLUMN termination TEXT"); } catch { /* already migrated */ }
   }
 
   private agentIdentity(): ConversationIdentity {

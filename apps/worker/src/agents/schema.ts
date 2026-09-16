@@ -32,6 +32,8 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
     started_at INTEGER,
     completed_at INTEGER,
     has_sent INTEGER NOT NULL DEFAULT 0,
+    terminal INTEGER NOT NULL DEFAULT 0,
+    termination TEXT CHECK (termination IN ('sent', 'silent')),
     last_error TEXT,
     created_at INTEGER NOT NULL
   )`,

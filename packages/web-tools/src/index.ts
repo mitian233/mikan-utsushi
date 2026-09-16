@@ -1,33 +1,32 @@
-const PRIVATE_IPV4_RANGES = [
-  /^127\./,
-  /^10\./,
-  /^192\.168\./,
-  /^169\.254\./,
-  /^172\.(1[6-9]|2\d|3[0-1])\./,
-];
+import { extractWebText, type ReadWebResult } from "./html-to-text";
+import { fetchReadableResource } from "./limited-fetch";
+import type { SearchResult } from "./exa-search";
+import type { DestinationResolver } from "./url-policy";
 
-const BLOCKED_HOSTS = new Set([
-  "localhost",
-  "localhost.localdomain",
-  "metadata.google.internal",
-  "metadata.google.com",
-]);
+export { ExaSearchClient } from "./exa-search";
+export type { SearchResult } from "./exa-search";
+export { validateDestination, validateReadOnlyUrl, isPublicAddress } from "./url-policy";
+export { fetchReadableResource } from "./limited-fetch";
+export { extractWebText } from "./html-to-text";
+export type { DestinationResolver } from "./url-policy";
+export type { ReadWebResult } from "./html-to-text";
 
-export function validateReadOnlyUrl(rawUrl: string): URL {
-  const url = new URL(rawUrl);
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("Only HTTP and HTTPS URLs are allowed");
-  }
-  if (url.username || url.password) {
-    throw new Error("URLs with embedded credentials are not allowed");
-  }
-  if (url.hostname.endsWith(".local") || url.hostname.endsWith(".internal")) {
-    throw new Error("Internal hostnames are not allowed");
-  }
-  if (BLOCKED_HOSTS.has(url.hostname) || PRIVATE_IPV4_RANGES.some((range) => range.test(url.hostname))) {
-    throw new Error("Private or metadata hosts are not allowed");
-  }
-  return url;
+export interface ReadWebOptions {
+  fetchFn?: typeof fetch;
+  resolver?: DestinationResolver;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  maxBytes?: number;
+  maxRedirects?: number;
+}
+
+export async function readWeb(url: string, options: ReadWebOptions = {}): Promise<ReadWebResult> {
+  const resource = await fetchReadableResource({ url, ...options });
+  return extractWebText({
+    url: resource.finalUrl,
+    contentType: resource.contentType,
+    body: resource.body,
+  });
 }
 
 export interface ReadWebTool {
@@ -35,5 +34,5 @@ export interface ReadWebTool {
 }
 
 export interface SearchWebTool {
-  search(query: string): Promise<Array<{ title: string; url: string; snippet?: string }>>;
+  search(query: string): Promise<SearchResult[]>;
 }

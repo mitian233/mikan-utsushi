@@ -58,6 +58,7 @@ pnpm exec wrangler secret put EXA_API_KEY
 | `VISION_ENABLED` | 否 | `true` | 只能是 `true` 或 `false` |
 | `CONTEXT_MESSAGE_LIMIT` | 否 | `50` | 正整数 |
 | `MESSAGE_RETENTION_LIMIT` | 否 | `5000` | 正整数，且 ≥ `CONTEXT_MESSAGE_LIMIT` |
+| `TURN_DEBUG_ENABLED` | 否 | `false` | 只能是 `true` 或 `false`；见下方「排查问题」 |
 
 `LLM_CHAT_COMPLETIONS_URL`、`LLM_MODEL` 是必填但没有默认值，若未设置，配置解析会在首个回调时抛错。建议与 Secret 一起通过 Wrangler 配置或 `--var` 明确设置。
 
@@ -99,11 +100,56 @@ curl -s https://<你的 worker 域名>/health
 2. 连续快速发送两条，确认合并为一次回复（2 秒窗口）；
 3. 确认日志中没有 `invalid signature` 或 `agent unavailable`。
 
-## 7. 行为调整
+## 7. 排查问题
+
+机器人静默时，最常见的原因是**模型没有调用 `send_message`**。普通 assistant 文本不会发到 QQ，只有 `send_message` 才有外部效果。
+
+打开调试落表后，每个 turn 的模型往返都会写进该 Agent 的 `turn_debug` 表，可在 Durable Object 的 SQLite 控制台直接查询：
+
+```bash
+cd apps/worker
+pnpm exec wrangler secret put TURN_DEBUG_ENABLED   # 输入 true
+# 触发一条消息后，重新 deploy
+pnpm exec wrangler deploy
+```
+
+```sql
+-- 按时间顺序看某个 Agent 的全部调试记录
+SELECT id, turn_id, attempt_count, round, event, payload, created_at
+FROM turn_debug ORDER BY id DESC LIMIT 50;
+
+-- 只看模型每轮返回的原文
+SELECT round, payload FROM turn_debug
+WHERE event = 'model_response' ORDER BY id DESC LIMIT 20;
+
+-- 只看失败原因
+SELECT payload, created_at FROM turn_debug
+WHERE event = 'turn_error' ORDER BY id DESC LIMIT 20;
+```
+
+`event` 取值：
+
+| event | 含义 |
+| --- | --- |
+| `model_request` | 该轮发给模型的完整 messages（含 system prompt）与 tools |
+| `model_response` | 模型该轮的原始返回，含 `content` 与 `toolCalls` |
+| `turn_error` | turn 失败原因 |
+
+字段：`turn_id`、`attempt_count`（第几次尝试）、`round`（该次尝试内的第几轮模型调用）、`event`、`payload`（JSON）、`created_at`。
+
+**安全警示**：开启后 `turn_debug` 会持久化**未脱敏**的完整模型请求与回复，其中可能包含私聊正文、网页正文和 Memory 内容。此表与已脱敏的 `tool_calls` 审计表相互独立。仅在排查期间开启，完成后关闭并清理：
+
+```sql
+DELETE FROM turn_debug;
+```
+
+关闭方式：`pnpm exec wrangler secret put TURN_DEBUG_ENABLED` 输入 `false`，然后重新部署。`turn_debug` 不参与 `MESSAGE_RETENTION_LIMIT` 自动清理，需手动删除。
+
+## 8. 行为调整
 
 人格与聊天行为来自源代码 `apps/worker/src/prompts/system-prompt.md`。修改后需要重新部署；没有 dashboard 或在线提示词编辑。
 
-## 8. 回滚
+## 9. 回滚
 
 Cloudflare 控制台可回滚到上一个部署版本。注意 Durable Object SQLite 状态不会随代码回滚，历史消息、Memory、turn 与 delivery 记录保留。
 

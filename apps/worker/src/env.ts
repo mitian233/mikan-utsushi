@@ -11,6 +11,7 @@ export interface Env {
   VISION_ENABLED?: string;
   CONTEXT_MESSAGE_LIMIT?: string;
   MESSAGE_RETENTION_LIMIT?: string;
+  TURN_DEBUG_ENABLED?: string;
 }
 
 export interface RuntimeConfig {
@@ -25,6 +26,7 @@ export interface RuntimeConfig {
   visionEnabled: boolean;
   contextMessageLimit: number;
   messageRetentionLimit: number;
+  turnDebugEnabled: boolean;
 }
 
 const DEFAULT_QQ_API_BASE = "https://api.sgroup.qq.com";
@@ -37,6 +39,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
   validateHttpUrl(llmUrl, "LLM_CHAT_COMPLETIONS_URL");
 
   const visionEnabled = parseVisionEnabled(env.VISION_ENABLED);
+  const turnDebugEnabled = parseTurnDebugEnabled(env.TURN_DEBUG_ENABLED);
   const contextMessageLimit = parsePositiveInteger(
     env.CONTEXT_MESSAGE_LIMIT,
     DEFAULT_CONTEXT_MESSAGE_LIMIT,
@@ -63,6 +66,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     visionEnabled,
     contextMessageLimit,
     messageRetentionLimit,
+    turnDebugEnabled,
   };
 }
 
@@ -90,6 +94,13 @@ function parseVisionEnabled(value: string | undefined): boolean {
   if (value === "true") return true;
   if (value === "false") return false;
   throw new Error("VISION_ENABLED must be exactly true or false");
+}
+
+function parseTurnDebugEnabled(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error("TURN_DEBUG_ENABLED must be exactly true or false");
 }
 
 function parsePositiveInteger(value: string | undefined, defaultValue: number, name: string): number {

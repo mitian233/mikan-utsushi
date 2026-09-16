@@ -58,6 +58,16 @@ describe("parseRuntimeConfig", () => {
     expect(() => parseRuntimeConfig(validEnv({ VISION_ENABLED: "yes" }))).toThrow();
   });
 
+  it("disables turn debug capture by default", () => {
+    expect(parseRuntimeConfig(validEnv()).turnDebugEnabled).toBe(false);
+  });
+
+  it("enables turn debug capture only for the exact string true", () => {
+    expect(parseRuntimeConfig(validEnv({ TURN_DEBUG_ENABLED: "true" })).turnDebugEnabled).toBe(true);
+    expect(parseRuntimeConfig(validEnv({ TURN_DEBUG_ENABLED: "false" })).turnDebugEnabled).toBe(false);
+    expect(() => parseRuntimeConfig(validEnv({ TURN_DEBUG_ENABLED: "1" }))).toThrow();
+  });
+
   it.each(["0", "-1", "1.5", "abc", ""])("rejects a non-positive integer limit: %s", (limit) => {
     expect(() => parseRuntimeConfig(validEnv({ CONTEXT_MESSAGE_LIMIT: limit }))).toThrow();
   });

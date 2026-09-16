@@ -31,6 +31,17 @@ export type ToolCallAuditEvent = {
   error?: unknown;
 };
 
+/**
+ * Raw per-round trace used only for operator debugging. It deliberately
+ * carries unredacted model input/output, so it must never be persisted unless
+ * TURN_DEBUG_ENABLED is explicitly turned on.
+ */
+export type TurnDebugEvent = {
+  round: number;
+  event: "model_request" | "model_response";
+  payload: unknown;
+};
+
 export interface TurnRunnerContext {
   turnId: string;
   speakerId?: string;
@@ -66,6 +77,7 @@ export async function runToolLoop(input: {
   context: TurnRunnerContext;
   timeoutMs?: number;
   onToolCall?: (event: ToolCallAuditEvent) => void | Promise<void>;
+  onDebug?: (event: TurnDebugEvent) => void | Promise<void>;
 }): Promise<ToolLoopResult> {
   const timeoutMs = input.timeoutMs ?? 120_000;
   const controller = new AbortController();
@@ -84,10 +96,14 @@ export async function runToolLoop(input: {
   const messages = [...input.messages];
   const usage: NonNullable<ChatCompletionResult["usage"]>[] = [];
   let sentCount = 0;
+  let round = 0;
 
   try {
     while (true) {
+      round += 1;
+      await input.onDebug?.({ round, event: "model_request", payload: { messages, tools: input.tools } });
       const completion = await input.client.complete({ messages, tools: input.tools }, controller.signal);
+      await input.onDebug?.({ round, event: "model_response", payload: completion });
       if (completion.usage) usage.push(completion.usage);
       const toolCalls = completion.message.toolCalls;
       messages.push({

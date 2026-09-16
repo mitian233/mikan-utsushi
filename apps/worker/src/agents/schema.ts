@@ -91,4 +91,15 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
     ON memories (scope, updated_at)`,
   `CREATE INDEX IF NOT EXISTS idx_qq_memories_scope_content
     ON memories (scope, content)`,
+  `CREATE TABLE IF NOT EXISTS turn_debug (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_id TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    round INTEGER NOT NULL,
+    event TEXT NOT NULL CHECK (event IN ('model_request', 'model_response', 'turn_error')),
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_qq_turn_debug_turn
+    ON turn_debug (turn_id, id)`,
 ];

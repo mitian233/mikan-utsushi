@@ -5,7 +5,12 @@ import { Agent } from "agents";
 import { SYSTEM_PROMPT } from "../prompts";
 import { parseRuntimeConfig, type Env, type RuntimeConfig } from "../env";
 import { buildInitialModelMessages, type ContextMessage } from "./context";
-import { runToolLoop, type ToolCallAuditEvent, type ToolRuntime } from "./turn-runner";
+import {
+  runToolLoop,
+  type ToolCallAuditEvent,
+  type ToolRuntime,
+  type TurnDebugEvent,
+} from "./turn-runner";
 import {
   MEMORY_TOOL_DEFINITIONS,
   MemoryToolRuntime,
@@ -193,6 +198,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
     const hasSent = persistedHasSent || outcome.hasSent;
     if (outcome.error !== undefined) {
       const errorText = errorMessage(outcome.error);
+      this.recordTurnError(payload.turnId, errorText);
       if (hasSent) {
         this.markTurnFailed(payload.turnId, errorText, true);
         return;
@@ -290,6 +296,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
         chatId: conversationIdentity?.chatId,
       },
       onToolCall: (event) => this.persistToolCallAudit(turnId, event),
+      onDebug: (event) => this.persistTurnDebug(turnId, event),
     });
     return { hasSent: result.sentCount > 0 };
   }
@@ -405,6 +412,59 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       await this.ctx.storage.delete("processor_scheduled");
       throw error;
     }
+  }
+
+  private turnDebugEnabled(): boolean {
+    try {
+      return this.getRuntimeConfig().turnDebugEnabled;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Persists an unredacted model request/response trace so an operator can
+   * inspect it in the Durable Object SQLite console. Disabled unless
+   * TURN_DEBUG_ENABLED is explicitly "true"; while disabled this is a no-op.
+   */
+  private persistTurnDebug(turnId: string, event: TurnDebugEvent): void {
+    if (!this.turnDebugEnabled()) return;
+    let payload: string;
+    try {
+      payload = JSON.stringify(event.payload) ?? String(event.payload);
+    } catch {
+      payload = String(event.payload);
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO turn_debug (turn_id, attempt_count, round, event, payload, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      turnId,
+      this.currentAttemptCount(turnId),
+      event.round,
+      event.event,
+      payload,
+      Date.now(),
+    );
+  }
+
+  private recordTurnError(turnId: string, error: string): void {
+    if (!this.turnDebugEnabled()) return;
+    this.ctx.storage.sql.exec(
+      `INSERT INTO turn_debug (turn_id, attempt_count, round, event, payload, created_at)
+       VALUES (?, ?, 0, 'turn_error', ?, ?)`,
+      turnId,
+      this.currentAttemptCount(turnId),
+      JSON.stringify({ message: error }),
+      Date.now(),
+    );
+  }
+
+  private currentAttemptCount(turnId: string): number {
+    return (
+      this.ctx.storage.sql
+        .exec<{ attempt_count: number }>("SELECT attempt_count FROM turns WHERE id = ?", turnId)
+        .toArray()[0]?.attempt_count ?? 0
+    );
   }
 
   private markTurnFailed(turnId: string, error: string, hasSent = false): void {

@@ -82,7 +82,7 @@ https://<你的 worker 域名>/webhooks/qq
 该端点处理：
 
 - `op 13` 验证握手（`plain_token` / `event_ts` → ed25519 signature，无需签名头）；
-- `op 0` 的 `GROUP_AT_MESSAGE_CREATE` 与 `C2C_MESSAGE_CREATE`。
+- `op 0` 的 `GROUP_AT_MESSAGE_CREATE` / `GROUP_MESSAGE_CREATE` 与 `C2C_MESSAGE_CREATE`。`GROUP_MESSAGE_CREATE` 仅在 QQ 开启「接收所有消息」时推送；两者字段相同。
 
 QQ 平台会先发起验证握手，因此部署完成后再注册回调。校验失败会返回 401。
 

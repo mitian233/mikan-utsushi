@@ -237,7 +237,7 @@ Co-Authored-By: openai-code-agent[bot] <242516109+Codex@users.noreply.github.com
 - Create: `packages/qqbot/src/signature.test.ts`
 
 **Interfaces:**
-- Consumes: QQ `GROUP_AT_MESSAGE_CREATE` and `C2C_MESSAGE_CREATE` payloads.
+- Consumes: QQ `GROUP_AT_MESSAGE_CREATE` / `GROUP_MESSAGE_CREATE` and `C2C_MESSAGE_CREATE` payloads. The two group event types share the same message-body shape; `GROUP_MESSAGE_CREATE` is used when QQ enables receive-all mode.
 - Produces: `ChatMessage` with `images`, `replyToMessageId`, exact group/C2C identities, and stable `eventId` deduplication input.
 
 - [ ] **Step 1: Write failing group and C2C normalization tests**

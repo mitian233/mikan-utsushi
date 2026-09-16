@@ -51,7 +51,7 @@ export function normalizeQQMessage(payload: QQWebhookPayload): ChatMessage | nul
   const username = stringValue(author?.username);
   if (!text && images.length === 0) return null;
 
-  if (payload.t === "GROUP_AT_MESSAGE_CREATE") {
+  if (payload.t === "GROUP_AT_MESSAGE_CREATE" || payload.t === "GROUP_MESSAGE_CREATE") {
     const groupId = stringValue(data.group_openid);
     const memberOpenId = stringValue(author?.member_openid);
     if (!groupId || !memberOpenId) return null;

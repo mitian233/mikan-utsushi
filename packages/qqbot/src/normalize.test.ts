@@ -42,6 +42,33 @@ describe("normalizeQQMessage", () => {
     });
   });
 
+  it("normalizes a QQ group message in receive-all mode", () => {
+    const result = normalizeQQMessage({
+      id: "event-group-all-1",
+      op: 0,
+      t: "GROUP_MESSAGE_CREATE",
+      d: {
+        id: "message-group-all-1",
+        group_openid: "group-openid-1",
+        content: "hello everyone",
+        timestamp: "2026-09-15T00:00:00.000Z",
+        author: {
+          member_openid: "member-openid-1",
+          username: "Mikan",
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      eventId: "event-group-all-1",
+      messageId: "message-group-all-1",
+      chatId: "group-openid-1",
+      chatKind: "group",
+      userId: "member-openid-1",
+      text: "hello everyone",
+    });
+  });
+
   it("uses the C2C user OpenID for both the conversation and author", () => {
     const result = normalizeQQMessage({
       id: "event-c2c-1",
@@ -149,7 +176,7 @@ describe("normalizeQQMessage", () => {
       normalizeQQMessage({
         id: "event-empty-1",
         op: 0,
-        t: "GROUP_AT_MESSAGE_CREATE",
+        t: "GROUP_MESSAGE_CREATE",
         d: {
           id: "message-empty-1",
           group_openid: "group-openid-1",

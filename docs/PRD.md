@@ -11,7 +11,7 @@
 ## 首版能力
 
 - 接收并验证 QQ 官方 Webhook。
-- 支持群聊 `GROUP_AT_MESSAGE_CREATE` 与私聊 `C2C_MESSAGE_CREATE`。
+- 支持群聊 `GROUP_AT_MESSAGE_CREATE` / `GROUP_MESSAGE_CREATE` 与私聊 `C2C_MESSAGE_CREATE`。
 - 在确认 Webhook 前持久化受支持消息，并按事件 ID 去重。
 - 将首条消息后两秒内收到的消息合并为一个模型轮次。
 - 每个群聊或私聊拥有独立的 Agent、SQLite、历史记录和 Memory。

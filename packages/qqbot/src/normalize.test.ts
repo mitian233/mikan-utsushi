@@ -80,6 +80,33 @@ describe("normalizeQQMessage", () => {
     });
   });
 
+  it("uses the envelope event id and falls back to the message id", () => {
+    const withEnvelopeId = normalizeQQMessage({
+      id: "envelope-event-id",
+      op: 0,
+      t: "GROUP_AT_MESSAGE_CREATE",
+      d: {
+        id: "message-id-present",
+        group_openid: "group-openid-1",
+        content: "hello",
+        author: { member_openid: "member-openid-1" },
+      },
+    });
+    const withoutEnvelopeId = normalizeQQMessage({
+      op: 0,
+      t: "GROUP_AT_MESSAGE_CREATE",
+      d: {
+        id: "message-id-fallback",
+        group_openid: "group-openid-1",
+        content: "hello",
+        author: { member_openid: "member-openid-1" },
+      },
+    });
+
+    expect(withEnvelopeId?.eventId).toBe("envelope-event-id");
+    expect(withoutEnvelopeId?.eventId).toBe("message-id-fallback");
+  });
+
   it("rejects a group message without member_openid even when user_openid is present", () => {
     const result = normalizeQQMessage({
       id: "event-group-missing-member-1",

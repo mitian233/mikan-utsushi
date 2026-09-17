@@ -13,6 +13,7 @@ export interface Env {
   MESSAGE_RETENTION_LIMIT?: string;
   MODEL_MAX_ROUNDS?: string;
   TURN_DEBUG_ENABLED?: string;
+  ADMIN_RETRY_SECRET?: string;
 }
 
 export interface RuntimeConfig {

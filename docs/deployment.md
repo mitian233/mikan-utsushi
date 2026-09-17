@@ -60,6 +60,7 @@ pnpm exec wrangler secret put EXA_API_KEY
 | `MESSAGE_RETENTION_LIMIT` | 否 | `5000` | 正整数，且 ≥ `CONTEXT_MESSAGE_LIMIT` |
 | `MODEL_MAX_ROUNDS` | 否 | `6` | 单轮模型调用最大轮次，正整数 |
 | `TURN_DEBUG_ENABLED` | 否 | `false` | 只能是 `true` 或 `false`；见下方「排查问题」 |
+| `ADMIN_RETRY_SECRET` | 否 | 无 | 手动重试 turn 的管理接口 Secret；仅临时排障使用 |
 
 `LLM_CHAT_COMPLETIONS_URL`、`LLM_MODEL` 是必填但没有默认值，若未设置，配置解析会在首个回调时抛错。建议与 Secret 一起通过 Wrangler 配置或 `--var` 明确设置。
 
@@ -137,6 +138,22 @@ WHERE event = 'turn_error' ORDER BY id DESC LIMIT 20;
 | `turn_error` | turn 失败原因 |
 
 字段：`turn_id`、`attempt_count`（第几次尝试）、`round`（该次尝试内的第几轮模型调用）、`event`、`payload`（JSON）、`created_at`。
+
+手动触发卡住的 turn（仅临时排障使用）：
+
+```bash
+cd apps/worker
+pnpm exec wrangler secret put ADMIN_RETRY_SECRET
+# 输入一个随机的临时 Secret
+pnpm exec wrangler deploy
+
+curl -X POST https://<你的 worker 域名>/admin/retry-turn \\
+  -H 'Authorization: Bearer <临时 Secret>' \\
+  -H 'Content-Type: application/json' \\
+  -d '{"agentName":"qq:group:<group_openid>","turnId":"<turn_id>"}'
+```
+
+接口只接受 `POST`，成功表示已调用对应 Agent 的 `retryTurn`。恢复后应删除该 Secret 并重新部署；不要长期暴露此管理接口。
 
 **安全警示**：开启后 `turn_debug` 会持久化**未脱敏**的完整模型请求与回复，其中可能包含私聊正文、网页正文和 Memory 内容。此表与已脱敏的 `tool_calls` 审计表相互独立。仅在排查期间开启，完成后关闭并清理：
 

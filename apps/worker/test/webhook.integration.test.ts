@@ -90,6 +90,36 @@ afterEach(async () => {
 });
 
 describe("QQ webhook integration", () => {
+  it("requires the admin secret for manual turn retries", async () => {
+    const response = await worker.fetch(
+      new Request("https://worker.test/admin/retry-turn", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agentName: "qq:group:admin-retry-group", turnId: "turn-1" }),
+      }),
+      { ...workerEnv, ADMIN_RETRY_SECRET: "admin-secret" },
+    );
+
+    expect(response.status).toBe(401);
+  });
+
+  it("invokes retryTurn for an authorized admin request", async () => {
+    const response = await worker.fetch(
+      new Request("https://worker.test/admin/retry-turn", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer admin-secret",
+        },
+        body: JSON.stringify({ agentName: "qq:group:admin-retry-group", turnId: "turn-1" }),
+      }),
+      { ...workerEnv, ADMIN_RETRY_SECRET: "admin-secret" },
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ ok: true, turnId: "turn-1" });
+  });
+
   it("persists a supported message once and ACKs duplicate events", async () => {
     expect((await sendWebhook(groupPayload())).status).toBe(200);
     expect((await sendWebhook(groupPayload())).status).toBe(200);

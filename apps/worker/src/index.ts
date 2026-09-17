@@ -22,6 +22,10 @@ export default {
       return Response.json({ ok: true, service: "mikan-utsushi" });
     }
 
+    if (url.pathname === "/admin/retry-turn" && request.method === "POST") {
+      return handleAdminRetryTurn(request, env);
+    }
+
     if (url.pathname === "/webhooks/qq" && request.method === "POST") {
       return handleQQWebhook(request, env);
     }
@@ -29,6 +33,52 @@ export default {
     return new Response("Not Found", { status: 404 });
   },
 };
+
+async function handleAdminRetryTurn(request: Request, env: Env): Promise<Response> {
+  if (!env.ADMIN_RETRY_SECRET || !constantTimeEqual(
+    request.headers.get("authorization")?.startsWith("Bearer ")
+      ? request.headers.get("authorization")!.slice("Bearer ".length)
+      : "",
+    env.ADMIN_RETRY_SECRET,
+  )) {
+    return json({ error: "unauthorized" }, 401);
+  }
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "invalid json" }, 400);
+  }
+  const input = asRecord(body);
+  const agentName = stringValue(input?.agentName);
+  const turnId = stringValue(input?.turnId);
+  if (!agentName || !/^qq:(group|c2c):[^:]+$/.test(agentName) || !turnId || turnId.length > 200) {
+    return json({ error: "invalid retry request" }, 400);
+  }
+
+  try {
+    const id = env.GROUP_CHAT_AGENT.idFromName(agentName);
+    const stub = env.GROUP_CHAT_AGENT.get(id) as unknown as {
+      retryTurn(input: { turnId: string }): Promise<void>;
+    };
+    await stub.retryTurn({ turnId });
+    return json({ ok: true, turnId });
+  } catch {
+    return json({ error: "retry unavailable" }, 503);
+  }
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+  const leftBytes = new TextEncoder().encode(left);
+  const rightBytes = new TextEncoder().encode(right);
+  let difference = leftBytes.length ^ rightBytes.length;
+  const length = Math.max(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < length; index += 1) {
+    difference |= (leftBytes[index] ?? 0) ^ (rightBytes[index] ?? 0);
+  }
+  return difference === 0;
+}
 
 async function handleQQWebhook(request: Request, env: Env): Promise<Response> {
   const rawBody = await request.arrayBuffer();

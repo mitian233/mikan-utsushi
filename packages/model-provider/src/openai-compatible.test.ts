@@ -100,32 +100,6 @@ describe("OpenAICompatibleClient", () => {
     });
   });
 
-  it("sends required tool choice when requested", async () => {
-    let request: Request | undefined;
-    const client = new OpenAICompatibleClient({
-      url: "https://gateway.example/custom/chat",
-      apiKey: "secret",
-      model: "compatible-model",
-      fetchFn: async (input, init) => {
-        request = new Request(input, init);
-        return completionResponse(assistantResponse({ content: null, tool_calls: [] }));
-      },
-    });
-
-    await client.complete(
-      { messages, tools, toolChoice: "required", parallelToolCalls: false },
-      new AbortController().signal,
-    );
-
-    expect(await request?.json()).toEqual({
-      model: "compatible-model",
-      messages,
-      tools,
-      tool_choice: "required",
-      parallel_tool_calls: false,
-    });
-  });
-
   it("maps multiple tool calls without changing their arguments", async () => {
     const client = new OpenAICompatibleClient({
       url: "https://gateway.example/custom/chat",

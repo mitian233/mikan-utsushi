@@ -24,8 +24,6 @@ export interface ModelToolDefinition {
   };
 }
 
-export type ModelToolChoice = "auto" | "required" | { type: "function"; function: { name: string } };
-
 export interface ChatCompletionResult {
   message: {
     role: "assistant";
@@ -168,13 +166,11 @@ function validateCompletion(value: unknown): ChatCompletionResult {
   };
 }
 
-function requestBody(input: { messages: ModelMessage[]; tools: ModelToolDefinition[]; toolChoice?: ModelToolChoice; parallelToolCalls?: boolean }, model: string) {
+function requestBody(input: { messages: ModelMessage[]; tools: ModelToolDefinition[] }, model: string) {
   return {
     model,
     messages: input.messages,
     tools: input.tools,
-    ...(input.toolChoice ? { tool_choice: input.toolChoice } : {}),
-    ...(input.parallelToolCalls !== undefined ? { parallel_tool_calls: input.parallelToolCalls } : {}),
   };
 }
 
@@ -203,7 +199,7 @@ export class OpenAICompatibleClient {
   }
 
   async complete(
-    input: { messages: ModelMessage[]; tools: ModelToolDefinition[]; toolChoice?: ModelToolChoice; parallelToolCalls?: boolean },
+    input: { messages: ModelMessage[]; tools: ModelToolDefinition[] },
     signal: AbortSignal,
   ): Promise<ChatCompletionResult> {
     if (this.sdk) {

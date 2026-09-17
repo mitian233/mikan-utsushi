@@ -23,6 +23,7 @@ describe("parseRuntimeConfig", () => {
       visionEnabled: true,
       contextMessageLimit: 50,
       messageRetentionLimit: 5000,
+      modelMaxRounds: 6,
     });
   });
 
@@ -70,6 +71,14 @@ describe("parseRuntimeConfig", () => {
 
   it.each(["0", "-1", "1.5", "abc", ""])("rejects a non-positive integer limit: %s", (limit) => {
     expect(() => parseRuntimeConfig(validEnv({ CONTEXT_MESSAGE_LIMIT: limit }))).toThrow();
+  });
+
+  it("accepts a custom model max rounds setting", () => {
+    expect(parseRuntimeConfig(validEnv({ MODEL_MAX_ROUNDS: "9" })).modelMaxRounds).toBe(9);
+  });
+
+  it.each(["0", "-1", "1.5", "abc", ""])("rejects an invalid model max rounds setting: %s", (value) => {
+    expect(() => parseRuntimeConfig(validEnv({ MODEL_MAX_ROUNDS: value }))).toThrow();
   });
 
   it("rejects retention below the context limit", () => {

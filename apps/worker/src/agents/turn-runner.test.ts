@@ -107,6 +107,32 @@ describe("buildInitialModelMessages", () => {
 });
 
 describe("runToolLoop", () => {
+  it("does not send unsupported tool control parameters to the model backend", async () => {
+    const requests: unknown[] = [];
+    const client = {
+      complete: async (input: { messages: ModelMessage[]; tools: ModelToolDefinition[] }) => {
+        requests.push({ ...input, messages: structuredClone(input.messages) });
+        return completion(null, [sendCall("silent-1", { action: "silent" })]);
+      },
+    };
+    const runtime: ToolRuntime = {
+      execute: async () => ({ content: JSON.stringify({ outcome: "silent" }), terminal: true, termination: "silent" }),
+    };
+
+    await runToolLoop({
+      client,
+      messages: [{ role: "system", content: SYSTEM_PROMPT }],
+      tools: [tool],
+      runtime,
+      context: { turnId: "turn-unsupported-params" },
+    });
+
+    expect(requests[0]).toEqual({
+      messages: [{ role: "system", content: SYSTEM_PROMPT }],
+      tools: [tool],
+    });
+  });
+
   it("executes work tools and requires a terminal message tool", async () => {
     const inputs: Array<{ messages: ModelMessage[]; signal: AbortSignal }> = [];
     const responses = [
@@ -276,7 +302,7 @@ describe("runToolLoop", () => {
     }));
   });
 
-  it("stops after twelve non-terminal rounds", async () => {
+  it("stops after the configured maximum non-terminal rounds", async () => {
     let completionCount = 0;
     const client = {
       complete: async () => {
@@ -286,9 +312,9 @@ describe("runToolLoop", () => {
     };
     const runtime: ToolRuntime = { execute: async () => ({ content: "unused" }) };
 
-    await expect(runToolLoop({ client, messages: [], tools: [tool], runtime, context: { turnId: "turn-max-rounds" } }))
-      .rejects.toThrow("within 12 rounds");
-    expect(completionCount).toBe(12);
+    await expect(runToolLoop({ client, messages: [], tools: [tool], runtime, context: { turnId: "turn-max-rounds" }, maxRounds: 3 }))
+      .rejects.toThrow("within 3 rounds");
+    expect(completionCount).toBe(3);
   });
 
   it("uses one shared 120-second deadline for model and tool work", async () => {

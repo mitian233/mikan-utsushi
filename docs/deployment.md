@@ -58,6 +58,7 @@ pnpm exec wrangler secret put EXA_API_KEY
 | `VISION_ENABLED` | 否 | `true` | 只能是 `true` 或 `false` |
 | `CONTEXT_MESSAGE_LIMIT` | 否 | `50` | 正整数 |
 | `MESSAGE_RETENTION_LIMIT` | 否 | `5000` | 正整数，且 ≥ `CONTEXT_MESSAGE_LIMIT` |
+| `MODEL_MAX_ROUNDS` | 否 | `6` | 单轮模型调用最大轮次，正整数 |
 | `TURN_DEBUG_ENABLED` | 否 | `false` | 只能是 `true` 或 `false`；见下方「排查问题」 |
 
 `LLM_CHAT_COMPLETIONS_URL`、`LLM_MODEL` 是必填但没有默认值，若未设置，配置解析会在首个回调时抛错。建议与 Secret 一起通过 Wrangler 配置或 `--var` 明确设置。

@@ -311,6 +311,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       messages,
       tools: [...MEMORY_TOOL_DEFINITIONS, ...WEB_TOOL_DEFINITIONS, SEND_MESSAGE_TOOL_DEFINITION],
       runtime,
+      maxRounds: runtimeConfig.modelMaxRounds,
       context: {
         turnId,
         speakerId: turnMessages.find((message) => message.direction === "inbound")?.userId ?? undefined,

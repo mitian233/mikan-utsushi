@@ -11,6 +11,7 @@ export interface Env {
   VISION_ENABLED?: string;
   CONTEXT_MESSAGE_LIMIT?: string;
   MESSAGE_RETENTION_LIMIT?: string;
+  MODEL_MAX_ROUNDS?: string;
   TURN_DEBUG_ENABLED?: string;
 }
 
@@ -26,6 +27,7 @@ export interface RuntimeConfig {
   visionEnabled: boolean;
   contextMessageLimit: number;
   messageRetentionLimit: number;
+  modelMaxRounds: number;
   turnDebugEnabled: boolean;
 }
 
@@ -33,6 +35,7 @@ const DEFAULT_QQ_API_BASE = "https://api.sgroup.qq.com";
 const DEFAULT_QQ_TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken";
 const DEFAULT_CONTEXT_MESSAGE_LIMIT = 50;
 const DEFAULT_MESSAGE_RETENTION_LIMIT = 5000;
+const DEFAULT_MODEL_MAX_ROUNDS = 6;
 
 export function parseRuntimeConfig(env: Env): RuntimeConfig {
   const llmUrl = requiredString(env.LLM_CHAT_COMPLETIONS_URL, "LLM_CHAT_COMPLETIONS_URL");
@@ -50,6 +53,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     DEFAULT_MESSAGE_RETENTION_LIMIT,
     "MESSAGE_RETENTION_LIMIT",
   );
+  const modelMaxRounds = parsePositiveInteger(env.MODEL_MAX_ROUNDS, DEFAULT_MODEL_MAX_ROUNDS, "MODEL_MAX_ROUNDS");
   if (messageRetentionLimit < contextMessageLimit) {
     throw new Error("MESSAGE_RETENTION_LIMIT must be greater than or equal to CONTEXT_MESSAGE_LIMIT");
   }
@@ -66,6 +70,7 @@ export function parseRuntimeConfig(env: Env): RuntimeConfig {
     visionEnabled,
     contextMessageLimit,
     messageRetentionLimit,
+    modelMaxRounds,
     turnDebugEnabled,
   };
 }

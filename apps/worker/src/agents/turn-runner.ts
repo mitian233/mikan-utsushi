@@ -60,7 +60,7 @@ export interface ToolLoopResult {
 
 export interface ModelCompletionClient {
   complete(
-    input: { messages: ModelMessage[]; tools: ModelToolDefinition[]; toolChoice?: "required"; parallelToolCalls?: false },
+    input: { messages: ModelMessage[]; tools: ModelToolDefinition[] },
     signal: AbortSignal,
   ): Promise<ChatCompletionResult>;
 }
@@ -79,10 +79,12 @@ export async function runToolLoop(input: {
   runtime: ToolRuntime;
   context: TurnRunnerContext;
   timeoutMs?: number;
+  maxRounds?: number;
   onToolCall?: (event: ToolCallAuditEvent) => void | Promise<void>;
   onDebug?: (event: TurnDebugEvent) => void | Promise<void>;
 }): Promise<ToolLoopResult> {
   const timeoutMs = input.timeoutMs ?? 120_000;
+  const maxRounds = input.maxRounds ?? 6;
   const controller = new AbortController();
   const parentSignal = input.context.signal;
   const abortFromParent = () => controller.abort(parentSignal?.reason);
@@ -100,14 +102,13 @@ export async function runToolLoop(input: {
   const usage: NonNullable<ChatCompletionResult["usage"]>[] = [];
   let sentCount = 0;
   let round = 0;
-  const maxRounds = 12;
 
   try {
     while (true) {
       round += 1;
-      if (round > maxRounds) throw new Error("Model failed to produce terminal send_message call within 12 rounds");
+      if (round > maxRounds) throw new Error(`Model failed to produce terminal send_message call within ${maxRounds} rounds`);
       await input.onDebug?.({ round, event: "model_request", payload: { messages, tools: input.tools } });
-      const completion = await input.client.complete({ messages, tools: input.tools, toolChoice: "required", parallelToolCalls: false }, controller.signal);
+      const completion = await input.client.complete({ messages, tools: input.tools }, controller.signal);
       await input.onDebug?.({ round, event: "model_response", payload: completion });
       if (completion.usage) usage.push(completion.usage);
       const toolCalls = completion.message.toolCalls;

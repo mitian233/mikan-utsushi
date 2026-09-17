@@ -64,7 +64,12 @@ async function handleAdminRetryTurn(request: Request, env: Env): Promise<Respons
     };
     await stub.retryTurn({ turnId });
     return json({ ok: true, turnId });
-  } catch {
+  } catch (error) {
+    console.error("admin retry-turn failed", {
+      agentName,
+      turnId,
+      error: error instanceof Error ? error.message : String(error),
+    });
     return json({ error: "retry unavailable" }, 503);
   }
 }

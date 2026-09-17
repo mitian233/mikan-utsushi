@@ -151,6 +151,9 @@ describe("GroupChatAgent batching and retries", () => {
       agent.schedule = async () => undefined;
       await seedMessage(agent, message("message-1"));
       await agent.flushPending();
+      agent.executeTurn = async () => ({ hasSent: false });
+      const firstTurnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
+      await agent.runTurn({ turnId: firstTurnId });
       await seedMessage(agent, message("message-2"));
       await agent.flushPending();
 
@@ -171,17 +174,15 @@ describe("GroupChatAgent batching and retries", () => {
     expect(result.turnMessages).toHaveLength(2);
     expect(result.turnMessages.map((row) => row.turn_id)).toEqual([result.turns[0]?.id, result.turns[1]?.id]);
     expect(result.messages.map((row) => row.turn_id)).toEqual([result.turns[0]?.id, result.turns[1]?.id]);
-    expect(result.messages.map((row) => row.status)).toEqual(["batched", "batched"]);
+    expect(result.messages.map((row) => row.status)).toEqual(["visible", "batched"]);
   });
 
-  it("does not run two turns concurrently and preserves FIFO order", async () => {
+  it("does not run the same turn concurrently when its callback is duplicated", async () => {
     await withAgent(async (agent, state) => {
       agent.schedule = async () => undefined;
       await seedMessage(agent, message("message-1"));
       await agent.flushPending();
-      await seedMessage(agent, message("message-2"));
-      await agent.flushPending();
-      const turnIds = rows<{ id: string }>(state, "SELECT id FROM turns ORDER BY created_at, id").map((row) => row.id);
+      const turnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
       let active = 0;
       let maxActive = 0;
       let release!: () => void;
@@ -194,17 +195,14 @@ describe("GroupChatAgent batching and retries", () => {
         return { hasSent: false };
       };
 
-      const first = agent.runTurn({ turnId: turnIds[0]! });
+      const first = agent.runTurn({ turnId });
       await Promise.resolve();
-      const second = agent.runTurn({ turnId: turnIds[1]! });
-      await second;
+      const duplicate = agent.runTurn({ turnId });
+      await duplicate;
       expect(maxActive).toBe(1);
       release();
       await first;
-      expect(rows<{ status: string }>(state, "SELECT status FROM turns ORDER BY created_at, id").map((row) => row.status)).toEqual([
-        "completed",
-        "queued",
-      ]);
+      expect(rows<{ status: string }>(state, "SELECT status FROM turns")[0]?.status).toBe("completed");
     });
   });
 
@@ -307,9 +305,12 @@ describe("GroupChatAgent batching and retries", () => {
     expect(result.retryCalls).toHaveLength(0);
   });
 
-  it("keeps the first turn running while a message received during it forms a second turn", async () => {
-    await withAgent(async (agent, state) => {
-      agent.schedule = async () => undefined;
+  it("merges messages received during a running turn into one successor turn", async () => {
+    const result = await withAgent(async (agent, state) => {
+      const scheduleCalls: ScheduleCall[] = [];
+      agent.schedule = async (...args: unknown[]) => {
+        scheduleCalls.push(args);
+      };
       await seedMessage(agent, message("message-1"));
       await agent.flushPending();
       const firstTurnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
@@ -317,33 +318,42 @@ describe("GroupChatAgent batching and retries", () => {
       const started = new Promise<void>((resolve) => { executionStarted = resolve; });
       let release!: () => void;
       const blocked = new Promise<void>((resolve) => { release = resolve; });
-      let active = 0;
-      let maxActive = 0;
       agent.executeTurn = async () => {
-        active += 1;
-        maxActive = Math.max(maxActive, active);
         executionStarted();
         await blocked;
-        active -= 1;
         return { hasSent: false };
       };
 
       const firstRun = agent.runTurn({ turnId: firstTurnId });
       await started;
+      await seedMessage(agent, message("message-2"));
       await seedMessage(agent, message("message-3"));
       await agent.flushPending();
-      const turnIds = rows<{ id: string }>(state, "SELECT id FROM turns ORDER BY created_at, id").map((row) => row.id);
-      expect(turnIds).toHaveLength(2);
-
-      const secondRun = agent.runTurn({ turnId: turnIds[1]! });
-      await secondRun;
-      expect(maxActive).toBe(1);
-      expect(rows<{ status: string }>(state, `SELECT status FROM turns WHERE id = '${turnIds[1]}'`)[0]?.status).toBe("queued");
+      expect(rows<{ id: string }>(state, "SELECT id FROM turns ORDER BY created_at, id")).toHaveLength(1);
+      expect(rows<{ id: string; status: string }>(state, "SELECT id, status FROM messages WHERE status = 'pending' ORDER BY id")).toHaveLength(2);
 
       release();
       await firstRun;
-      expect(active).toBe(0);
+      const turns = rows<{ id: string; status: string }>(state, "SELECT id, status FROM turns ORDER BY created_at, id");
+      const successorId = turns[1]!.id;
+      return {
+        turns,
+        successorMessages: rows<{ message_id: string; position: number }>(
+          state,
+          `SELECT message_id, position FROM turn_messages WHERE turn_id = '${successorId}' ORDER BY position`,
+        ),
+        runCalls: scheduleCalls.filter((call) => call[1] === "runTurn"),
+      };
     });
+
+    expect(result.turns).toHaveLength(2);
+    expect(result.turns[0]?.status).toBe("completed");
+    expect(result.turns[1]?.status).toBe("queued");
+    expect(result.successorMessages).toEqual([
+      { message_id: 2, position: 0 },
+      { message_id: 3, position: 1 },
+    ]);
+    expect(result.runCalls).toHaveLength(2);
   });
 
   it("retains only the newest visible chat rows after completion", async () => {

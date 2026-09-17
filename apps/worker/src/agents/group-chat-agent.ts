@@ -98,6 +98,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
   async flushPending(): Promise<void> {
     this.ensureSchema();
     await this.ctx.storage.put("processor_scheduled", false);
+    if (this.hasBusyTurn()) return;
 
     const pending = this.ctx.storage.sql
       .exec<{ id: number; timestamp: number | null }>(
@@ -211,12 +212,14 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       this.recordTurnError(payload.turnId, errorText);
       if (hasSent) {
         this.markTurnFailed(payload.turnId, errorText, true);
+        await this.flushPending();
         return;
       }
 
       const delay = retryDelaySeconds(attemptCount);
       if (delay === null) {
         this.markTurnFailed(payload.turnId, errorText);
+        await this.flushPending();
         return;
       }
 
@@ -229,6 +232,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
         await this.schedule(delay, "retryTurn", payload);
       } catch (scheduleError) {
         this.markTurnFailed(payload.turnId, errorMessage(scheduleError));
+        await this.flushPending();
       }
       return;
     }
@@ -248,6 +252,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       payload.turnId,
     );
     await this.maybeCleanupVisibleMessages();
+    await this.flushPending();
   }
 
   private async maybeCleanupVisibleMessages(): Promise<void> {
@@ -417,6 +422,14 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
     );
   }
 
+  private hasBusyTurn(): boolean {
+    return this.ctx.storage.sql
+      .exec<{ id: string }>(
+        "SELECT id FROM turns WHERE status IN ('queued', 'running', 'retry_wait') LIMIT 1",
+      )
+      .toArray().length > 0;
+  }
+
   private async scheduleFlushIfPending(): Promise<void> {
     const pending = this.ctx.storage.sql
       .exec<{ id: number }>("SELECT id FROM messages WHERE status = 'pending' LIMIT 1")
@@ -426,6 +439,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       return;
     }
 
+    if (this.hasBusyTurn()) return;
     if (await this.ctx.storage.get<boolean>("processor_scheduled")) return;
 
     await this.ctx.storage.put("processor_scheduled", true);

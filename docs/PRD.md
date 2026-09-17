@@ -13,7 +13,7 @@
 - 接收并验证 QQ 官方 Webhook。
 - 支持群聊 `GROUP_AT_MESSAGE_CREATE` / `GROUP_MESSAGE_CREATE` 与私聊 `C2C_MESSAGE_CREATE`。
 - 在确认 Webhook 前持久化受支持消息，并按事件 ID 去重。
-- 将首条消息后两秒内收到的消息合并为一个模型轮次。
+- 空闲会话在首条消息后等待两秒形成首个模型轮次；模型轮次处于 queued、running 或 retry_wait 期间到达的消息持续积累，并在该轮次结束后合并为一个后续模型轮次。
 - 每个群聊或私聊拥有独立的 Agent、SQLite、历史记录和 Memory。
 - 通过用户指定的 OpenAI-compatible Chat Completions 接口调用模型。
 - 支持模型 Function Calling，并由模型主动结束轮次。
@@ -133,7 +133,7 @@ apps/worker/src/prompts/system-prompt.md
 
 1. 群聊和私聊 Webhook 均能形成正确、隔离的 Agent 会话。
 2. 无效签名被拒绝，重复事件不会造成重复处理或回复。
-3. 固定两秒合并窗口和轮次串行行为通过测试。
+3. 空闲会话的两秒首批窗口、运行期间消息合并和轮次串行行为通过测试。
 4. 模型可连续调用 Memory、搜索、网页读取和消息发送工具后主动结束轮次。
 5. 图片开关能准确控制模型请求中的 `image_url`。
 6. Memory 的群级和成员级范围不能互相泄漏。

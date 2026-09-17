@@ -32,6 +32,7 @@ describe("web tool runtime registration", () => {
       "memory_write",
       "memory_update",
       "memory_delete",
+      "conversation_search",
       "search_web",
       "read_web",
       "send_message",

@@ -21,7 +21,7 @@ describe("parseRuntimeConfig", () => {
       llmUrl: "https://api.deepseek.com/chat/completions",
       model: "deepseek-chat",
       visionEnabled: true,
-      contextMessageLimit: 50,
+      contextMessageLimit: 30,
       messageRetentionLimit: 5000,
       modelMaxRounds: 6,
     });

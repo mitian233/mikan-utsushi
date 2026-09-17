@@ -56,7 +56,7 @@ pnpm exec wrangler secret put EXA_API_KEY
 | `QQ_API_BASE` | 否 | `https://api.sgroup.qq.com` | 生产保持默认 |
 | `QQ_TOKEN_URL` | 否 | `https://bots.qq.com/app/getAppAccessToken` | 生产保持默认 |
 | `VISION_ENABLED` | 否 | `true` | 只能是 `true` 或 `false` |
-| `CONTEXT_MESSAGE_LIMIT` | 否 | `50` | 正整数 |
+| `CONTEXT_MESSAGE_LIMIT` | 否 | `30` | 自动注入模型上下文的最新可见聊天消息条数，正整数 |
 | `MESSAGE_RETENTION_LIMIT` | 否 | `5000` | 正整数，且 ≥ `CONTEXT_MESSAGE_LIMIT` |
 | `MODEL_MAX_ROUNDS` | 否 | `6` | 单轮模型调用最大轮次，正整数 |
 | `TURN_DEBUG_ENABLED` | 否 | `false` | 只能是 `true` 或 `false`；见下方「排查问题」 |

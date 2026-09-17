@@ -33,7 +33,7 @@ export interface RuntimeConfig {
 
 const DEFAULT_QQ_API_BASE = "https://api.sgroup.qq.com";
 const DEFAULT_QQ_TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken";
-const DEFAULT_CONTEXT_MESSAGE_LIMIT = 50;
+const DEFAULT_CONTEXT_MESSAGE_LIMIT = 30;
 const DEFAULT_MESSAGE_RETENTION_LIMIT = 5000;
 const DEFAULT_MODEL_MAX_ROUNDS = 6;
 

@@ -115,7 +115,7 @@ apps/worker/src/prompts/system-prompt.md
 - 首次发送前失败时，最多在 5、30、120 秒后重试三次。
 - QQ 明确拒绝发送时可以重试；结果不确定时不自动重发。
 - 一旦已成功发送，后续失败不得重放该消息。
-- `CONTEXT_MESSAGE_LIMIT` 默认 50，`MESSAGE_RETENTION_LIMIT` 默认 5000；Memory 不受聊天清理影响。
+- `CONTEXT_MESSAGE_LIMIT` 默认 30，采用滑动窗口自动注入最新可见消息；`MESSAGE_RETENTION_LIMIT` 默认 5000。超出上下文窗口的历史消息仍保留在 SQLite，Agent 可通过 `conversation_search` 按关键词、时间范围和条数主动检索；Memory 不受聊天清理影响。
 
 ## 非目标
 

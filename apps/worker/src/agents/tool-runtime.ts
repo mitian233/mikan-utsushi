@@ -15,6 +15,16 @@ type MemoryRow = {
   last_used_at: number | null;
 };
 
+type ConversationRow = {
+  id: number;
+  direction: "inbound" | "outbound";
+  user_id: string | null;
+  username: string | null;
+  text: string;
+  timestamp: number | null;
+  created_at: number;
+};
+
 type MemoryRecord = {
   id: string;
   scope: string;
@@ -97,6 +107,23 @@ export const MEMORY_TOOL_DEFINITIONS: ModelToolDefinition[] = [
         required: ["id"],
         properties: {
           id: { type: "string" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "conversation_search",
+      description: "Search older visible messages in the current QQ conversation. Use this when recent context does not contain the needed details.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          query: { type: "string" },
+          before: { type: "integer", description: "Only messages created before this Unix timestamp in milliseconds." },
+          after: { type: "integer", description: "Only messages created after this Unix timestamp in milliseconds." },
+          limit: { type: "integer", minimum: 1, maximum: 30 },
         },
       },
     },
@@ -211,12 +238,15 @@ function isTerminalSendMessageResult(value: unknown): value is TerminalSendMessa
 }
 
 const MAX_AUDIT_FIELD_LENGTH = 1_000;
+const CONVERSATION_SEARCH_DEFAULT_LIMIT = 30;
+const CONVERSATION_SEARCH_MAX_LIMIT = 30;
 
 const AUDIT_TOOL_NAMES = new Set([
   "memory_search",
   "memory_write",
   "memory_update",
   "memory_delete",
+  "conversation_search",
   "search_web",
   "read_web",
   "send_message",
@@ -242,6 +272,7 @@ const AUDIT_ARGUMENT_KEYS: Record<string, readonly string[]> = {
   memory_write: ["content", "scope", "source_message_id"],
   memory_update: ["id", "content"],
   memory_delete: ["id"],
+  conversation_search: ["query", "before", "after", "limit"],
   search_web: ["query"],
   read_web: ["url"],
   send_message: ["action", "content", "reply_to_message_id"],
@@ -408,6 +439,8 @@ export class MemoryToolRuntime implements ToolRuntime {
         return this.update(args, context);
       case "memory_delete":
         return this.remove(args, context);
+      case "conversation_search":
+        return this.searchConversation(args);
       case "search_web":
         return this.searchWeb(args, context);
       case "read_web":
@@ -579,6 +612,76 @@ export class MemoryToolRuntime implements ToolRuntime {
 
   private reconcileSentDelivery(delivery: DeliveryRow, context: ToolExecutionContext): void {
     this.finalizeSentDelivery(delivery, context);
+  }
+
+  private searchConversation(args: Record<string, unknown>): Array<{
+    id: string;
+    direction: "inbound" | "outbound";
+    userId: string | null;
+    username: string | null;
+    text: string;
+    timestamp: number | null;
+    createdAt: number;
+  }> {
+    const query = args.query === undefined
+      ? ""
+      : typeof args.query === "string"
+        ? args.query.trim()
+        : (() => { throw new Error("query must be a string"); })();
+    const before = this.optionalTimestamp(args.before, "before");
+    const after = this.optionalTimestamp(args.after, "after");
+    if (before !== undefined && after !== undefined && before <= after) {
+      throw new Error("before must be greater than after");
+    }
+    const limit = this.conversationSearchLimit(args.limit);
+    const conditions = ["status = 'visible'", "text IS NOT NULL"];
+    const parameters: Array<string | number> = [];
+    if (query !== "") {
+      conditions.push("text LIKE ? ESCAPE '\\'");
+      parameters.push(`%${escapeLike(query)}%`);
+    }
+    if (before !== undefined) {
+      conditions.push("created_at < ?");
+      parameters.push(before);
+    }
+    if (after !== undefined) {
+      conditions.push("created_at > ?");
+      parameters.push(after);
+    }
+    const rows = this.sql.exec<ConversationRow>(
+      `SELECT id, direction, user_id, username, text, timestamp, created_at
+       FROM messages
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY created_at DESC, id DESC
+       LIMIT ?`,
+      ...parameters,
+      limit,
+    ).toArray();
+    return rows.reverse().map((row) => ({
+      id: String(row.id),
+      direction: row.direction,
+      userId: row.user_id,
+      username: row.username,
+      text: row.text,
+      timestamp: row.timestamp,
+      createdAt: row.created_at,
+    }));
+  }
+
+  private optionalTimestamp(value: unknown, name: string): number | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`${name} must be a non-negative safe integer`);
+    }
+    return value;
+  }
+
+  private conversationSearchLimit(value: unknown): number {
+    if (value === undefined) return CONVERSATION_SEARCH_DEFAULT_LIMIT;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > CONVERSATION_SEARCH_MAX_LIMIT) {
+      throw new Error(`limit must be an integer between 1 and ${CONVERSATION_SEARCH_MAX_LIMIT}`);
+    }
+    return value;
   }
 
   private search(args: Record<string, unknown>, context: ToolExecutionContext): MemoryRecord[] {

@@ -28,12 +28,18 @@ afterEach(async () => {
 });
 
 describe("scoped memory tools", () => {
+  it("exposes conversation history search alongside memory tools", () => {
+    expect(MEMORY_TOOL_DEFINITIONS.map((tool) => tool.function.name)).toContain("conversation_search");
+    expect(JSON.stringify(MEMORY_TOOL_DEFINITIONS)).toContain("limit");
+  });
+
   it("exposes only group and current-user memory scopes", () => {
     expect(MEMORY_TOOL_DEFINITIONS.map((tool) => tool.function.name)).toEqual([
       "memory_search",
       "memory_write",
       "memory_update",
       "memory_delete",
+      "conversation_search",
     ]);
     expect(JSON.stringify(MEMORY_TOOL_DEFINITIONS)).not.toContain("user_id");
   });
@@ -109,6 +115,35 @@ describe("scoped memory tools", () => {
     expect(result.deniedUpdate).toMatchObject({ error: "Memory not found" });
     expect(result.deniedDelete).toMatchObject({ error: "Memory not found" });
     expect(result.allowedUpdate).toMatchObject({ content: "updated", scope: "user:member-a" });
+  });
+
+  it("searches visible conversation messages with a bounded result set", async () => {
+    const stub = namespace.get(namespace.idFromName("conversation-search"));
+    const result = await runInDurableObject(stub, async (_agent, state) => {
+      initializeSchema(state);
+      state.storage.sql.exec(
+        `INSERT INTO messages
+         (event_id, direction, chat_kind, chat_id, text, images_json, status, created_at)
+         VALUES (?, 'inbound', 'group', ?, ?, '[]', 'visible', ?),
+                (?, 'outbound', 'group', ?, ?, '[]', 'visible', ?),
+                (?, 'inbound', 'group', ?, ?, '[]', 'visible', ?),
+                (?, 'inbound', 'group', ?, ?, '[]', 'failed', ?)`,
+        "event-1", "group-1", "旧计划：迁移数据库", 100,
+        "event-2", "group-1", "已经完成迁移", 200,
+        "event-3", "group-1", "新的发布计划", 300,
+        "event-4", "group-1", "失败消息不应出现", 400,
+      );
+      const runtime = new MemoryToolRuntime(state.storage.sql);
+      const searched = await runtime.execute(
+        call("conversation_search", { query: "计划", limit: 1 }),
+        context(),
+      );
+      return JSON.parse(searched.content) as unknown;
+    });
+
+    expect(result).toEqual([
+      expect.objectContaining({ text: "新的发布计划", direction: "inbound" }),
+    ]);
   });
 
   it("does not create memories without an explicit memory tool call", async () => {

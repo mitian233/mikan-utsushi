@@ -88,6 +88,45 @@ function isAbortError(error: unknown): boolean {
   return typeof constructor === "function" && constructor.name === "APIUserAbortError";
 }
 
+const MAX_PROVIDER_ERROR_LENGTH = 500;
+const MAX_PROVIDER_ERROR_BODY_LENGTH = 16_000;
+
+function providerErrorDetail(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const detail = value.trim();
+    return detail ? detail.slice(0, MAX_PROVIDER_ERROR_LENGTH) : undefined;
+  }
+  if (!isRecord(value)) return undefined;
+  if (typeof value.message === "string" && value.message.trim()) {
+    return value.message.trim().slice(0, MAX_PROVIDER_ERROR_LENGTH);
+  }
+  if (isRecord(value.error)) return providerErrorDetail(value.error);
+  if (typeof value.detail === "string" && value.detail.trim()) {
+    return value.detail.trim().slice(0, MAX_PROVIDER_ERROR_LENGTH);
+  }
+  return undefined;
+}
+
+function providerErrorPayload(error: unknown): string | undefined {
+  if (!isRecord(error)) return providerErrorDetail(error);
+  if (error.error !== undefined) {
+    try {
+      const serialized = JSON.stringify(error.error);
+      if (serialized) return serialized.slice(0, MAX_PROVIDER_ERROR_BODY_LENGTH);
+    } catch {
+      // Fall back to the SDK-generated message below.
+    }
+  }
+  return providerErrorDetail(error);
+}
+
+function modelRequestError(status: number, detail?: string): ModelProviderError {
+  const normalizedDetail = detail?.replace(new RegExp(`^${status}\\s+`), "");
+  return new ModelProviderError(
+    `Model request failed with status ${status}${normalizedDetail ? `: ${normalizedDetail}` : ""}`,
+  );
+}
+
 function normalizeAbortError(error: unknown): ModelProviderAbortError {
   return error instanceof ModelProviderAbortError ? error : new ModelProviderAbortError({ cause: error });
 }
@@ -212,8 +251,10 @@ export class OpenAICompatibleClient {
       } catch (error) {
         if (isAbortError(error)) throw normalizeAbortError(error);
         if (error instanceof ModelProviderError) throw error;
-        const status = isRecord(error) && typeof error.status === "number" ? ` (${error.status})` : "";
-        throw new ModelProviderError(`Model request failed${status}`, { cause: error });
+        const status = isRecord(error) && typeof error.status === "number" ? error.status : undefined;
+        const detail = providerErrorPayload(error);
+        if (status !== undefined) throw modelRequestError(status, detail);
+        throw new ModelProviderError("Model request failed", { cause: error });
       }
     }
 
@@ -234,7 +275,14 @@ export class OpenAICompatibleClient {
     }
 
     if (!response.ok) {
-      throw new ModelProviderError(`Model request failed with status ${response.status}`);
+      let body: string | undefined;
+      try {
+        const rawBody = (await response.text()).trim();
+        if (rawBody) body = rawBody.slice(0, MAX_PROVIDER_ERROR_BODY_LENGTH);
+      } catch (error) {
+        if (isAbortError(error)) throw normalizeAbortError(error);
+      }
+      throw modelRequestError(response.status, body);
     }
 
     let body: CompletionResponse;

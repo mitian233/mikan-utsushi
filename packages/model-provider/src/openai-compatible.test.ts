@@ -170,15 +170,18 @@ describe("OpenAICompatibleClient", () => {
     );
   });
 
-  it("rejects non-2xx responses", async () => {
+  it("includes the complete raw provider error body for non-2xx responses", async () => {
+    const providerError = { unexpected_code: "E_TOOL_SCHEMA", details: { reason: "tools are not supported" } };
     const client = new OpenAICompatibleClient({
       url: "https://gateway.example/custom/chat",
       apiKey: "secret",
       model: "compatible-model",
-      fetchFn: async () => completionResponse({ error: { message: "overloaded" } }, 503),
+      fetchFn: async () => completionResponse(providerError, 400),
     });
 
-    await expect(client.complete({ messages, tools }, new AbortController().signal)).rejects.toThrow(/503/);
+    await expect(client.complete({ messages, tools }, new AbortController().signal)).rejects.toThrow(
+      `Model request failed with status 400: ${JSON.stringify(providerError)}`,
+    );
   });
 
   it("rejects an invalid completion response shape", async () => {
@@ -274,7 +277,7 @@ describe("OpenAICompatibleClient", () => {
     });
   });
 
-  it("maps standard SDK non-2xx responses without retrying", async () => {
+  it("maps standard SDK provider error details without retrying", async () => {
     let calls = 0;
     const client = new OpenAICompatibleClient({
       url: "https://gateway.example/v1/chat/completions",
@@ -282,11 +285,13 @@ describe("OpenAICompatibleClient", () => {
       model: "compatible-model",
       fetchFn: async () => {
         calls += 1;
-        return completionResponse({ error: { message: "overloaded" } }, 503);
+        return completionResponse({ error: { message: "model does not support tools" } }, 400);
       },
     });
 
-    await expect(client.complete({ messages, tools }, new AbortController().signal)).rejects.toThrow(/503/);
+    await expect(client.complete({ messages, tools }, new AbortController().signal)).rejects.toThrow(
+      `Model request failed with status 400: ${JSON.stringify({ message: "model does not support tools" })}`,
+    );
     expect(calls).toBe(1);
   });
 

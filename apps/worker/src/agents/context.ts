@@ -66,7 +66,7 @@ export function buildInitialModelMessages(input: InitialModelMessagesInput): Mod
   const visibleHistory = input.recentVisibleMessages
     .filter((message) => message.status === "visible" && isChatMessage(message) && !currentIds.has(message.id))
     .slice(-input.runtimeConfig.contextMessageLimit)
-    .map((message) => toModelMessage(message, input.runtimeConfig.visionEnabled))
+    .map((message) => toModelMessage(message, false))
     .filter((message): message is ModelMessage => message !== null);
 
   return [systemMessage, ...visibleHistory, ...current];

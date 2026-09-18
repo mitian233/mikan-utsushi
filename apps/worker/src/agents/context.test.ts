@@ -18,4 +18,27 @@ describe("buildInitialModelMessages", () => {
 
     expect(result.map((item) => item.content)).toEqual([expect.any(String), "middle", "newest", "current"]);
   });
+
+  it("omits images from historical messages while keeping current turn images", () => {
+    const historical: ContextMessage = {
+      ...message(1, "historical"),
+      images: [{ url: "https://multimedia.nt.qq.com/expired" }],
+    };
+    const current: ContextMessage = {
+      ...message(2, "current"),
+      images: [{ url: "https://multimedia.nt.qq.com/current" }],
+    };
+
+    const result = buildInitialModelMessages({
+      runtimeConfig: { visionEnabled: true, contextMessageLimit: 10 },
+      turnMessages: [current],
+      recentVisibleMessages: [historical],
+    });
+
+    expect(result).toEqual([
+      expect.objectContaining({ role: "system" }),
+      { role: "user", content: "historical" },
+      { role: "user", content: [{ type: "text", text: "current" }, { type: "image_url", image_url: { url: "https://multimedia.nt.qq.com/current" } }] },
+    ]);
+  });
 });

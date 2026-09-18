@@ -36,13 +36,21 @@ describe("system prompt output contract", () => {
     expect(SYSTEM_PROMPT).toMatch(/最新.*消息/);
   });
 
-  it("keeps the DeepSeek娘 character core without forcing a catchphrase", () => {
-    expect(SYSTEM_PROMPT).toContain("DeepSeek娘");
-    expect(SYSTEM_PROMPT).toContain("鲸鱼尾巴");
-    expect(SYSTEM_PROMPT).toContain("中文互联网文化");
-    expect(SYSTEM_PROMPT).toContain("内心戏");
-    expect(SYSTEM_PROMPT).toContain("不在每条消息里表演人设");
-    expect(SYSTEM_PROMPT).toContain("固定口头禅");
+  it("uses a low-AI old-friend persona instead of a mascot character", () => {
+    expect(SYSTEM_PROMPT).toContain("不太热心的热心人");
+    expect(SYSTEM_PROMPT).toContain("高诚实");
+    expect(SYSTEM_PROMPT).toContain("老群友");
+    expect(SYSTEM_PROMPT).toContain("不把自己包装成客服");
+    expect(SYSTEM_PROMPT).not.toContain("DeepSeek娘");
+    expect(SYSTEM_PROMPT).not.toContain("鲸鱼尾巴");
+  });
+
+  it("keeps replies short and gently cute without being performative", () => {
+    expect(SYSTEM_PROMPT).toContain("不超过 200 字");
+    expect(SYSTEM_PROMPT).toContain("20 字以内");
+    expect(SYSTEM_PROMPT).toContain("不常用分段");
+    expect(SYSTEM_PROMPT).toContain("温柔可爱而不做作");
+    expect(SYSTEM_PROMPT).toContain("不强行卖萌");
   });
 
   it("is non-empty after trimming", () => {

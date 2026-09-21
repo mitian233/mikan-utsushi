@@ -84,7 +84,7 @@ https://<你的 worker 域名>/webhooks/qq
 该端点处理：
 
 - `op 13` 验证握手（`plain_token` / `event_ts` → ed25519 signature，无需签名头）；
-- `op 0` 的 `GROUP_AT_MESSAGE_CREATE` / `GROUP_MESSAGE_CREATE` 与 `C2C_MESSAGE_CREATE`。两者字段相同；QQ 也可能在未开全量时把 @ 消息推成 `GROUP_MESSAGE_CREATE`。群聊回复都带 `msg_id`（被动引用），否则关闭主动消息的群会发送失败。
+- `op 0` 的 `GROUP_AT_MESSAGE_CREATE` / `GROUP_MESSAGE_CREATE` 与 `C2C_MESSAGE_CREATE`。两者字段相同；QQ 也可能在未开全量时把 @ 消息推成 `GROUP_MESSAGE_CREATE`。只有确认圈了 bot 的群消息才会带 `msg_id` 做被动引用：`GROUP_AT_MESSAGE_CREATE`，或 `GROUP_MESSAGE_CREATE` 且 `mentions[].is_you === true`。
 
 QQ 平台会先发起验证握手，因此部署完成后再注册回调。校验失败会返回 401。
 

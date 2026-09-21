@@ -134,23 +134,39 @@ describe("QQ webhook integration", () => {
     });
   });
 
-  it("persists GROUP_MESSAGE_CREATE as reply-required so passive quote works", async () => {
-    const payload = {
+  it("persists GROUP_MESSAGE_CREATE as reply-required only when the bot is mentioned", async () => {
+    const withoutMention = {
       ...groupPayload("event-group-message-create"),
       t: "GROUP_MESSAGE_CREATE",
     };
-    expect((await sendWebhook(payload)).status).toBe(200);
+    const withMention = {
+      ...groupPayload("event-group-bot-mention"),
+      t: "GROUP_MESSAGE_CREATE",
+      d: {
+        ...groupPayload("event-group-bot-mention").d as Record<string, unknown>,
+        mentions: [{ id: "bot-openid-1", is_you: true, bot: true }],
+      },
+    };
+    expect((await sendWebhook(withoutMention)).status).toBe(200);
+    expect((await sendWebhook(withMention)).status).toBe(200);
 
     const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
     const stub = namespace.get(namespace.idFromName("qq:group:group-openid-1"));
     const rows = await runInDurableObject(stub, (_agent, state) =>
-      state.storage.sql.exec("SELECT event_id, message_id, reply_required FROM messages").toArray(),
+      state.storage.sql.exec("SELECT event_id, message_id, reply_required FROM messages ORDER BY id").toArray(),
     );
-    expect(rows).toEqual([{
-      event_id: "event-group-message-create",
-      message_id: "message-event-group-message-create",
-      reply_required: 1,
-    }]);
+    expect(rows).toEqual([
+      {
+        event_id: "event-group-message-create",
+        message_id: "message-event-group-message-create",
+        reply_required: 0,
+      },
+      {
+        event_id: "event-group-bot-mention",
+        message_id: "message-event-group-bot-mention",
+        reply_required: 1,
+      },
+    ]);
   });
 
   it("runs a webhook-created group message through batching and one durable delivery", async () => {

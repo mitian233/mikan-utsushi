@@ -32,6 +32,11 @@ function replyToMessageId(value: unknown): string | undefined {
   return stringValue(record(value)?.message_id);
 }
 
+function mentionsThisBot(value: unknown): boolean {
+  if (!Array.isArray(value)) return false;
+  return value.some((item) => record(item)?.is_you === true);
+}
+
 function timestamp(value: unknown): number {
   if (typeof value !== "string") return Date.now();
   const parsed = Date.parse(value);
@@ -66,9 +71,7 @@ export function normalizeQQMessage(payload: QQWebhookPayload): ChatMessage | nul
       text,
       images,
       replyToMessageId: replyId,
-      // QQ may push @-bot group messages as GROUP_MESSAGE_CREATE even when
-      // receive-all is off. Passive reply still needs d.id as msg_id.
-      requiresReply: true,
+      requiresReply: payload.t === "GROUP_AT_MESSAGE_CREATE" || mentionsThisBot(data.mentions),
       timestamp: timestamp(data.timestamp),
     };
   }

@@ -43,7 +43,7 @@ describe("normalizeQQMessage", () => {
     });
   });
 
-  it("treats GROUP_MESSAGE_CREATE as a quote-required group mention", () => {
+  it("does not require a quote for GROUP_MESSAGE_CREATE without a bot mention", () => {
     const result = normalizeQQMessage({
       id: "event-group-all-1",
       op: 0,
@@ -67,6 +67,33 @@ describe("normalizeQQMessage", () => {
       chatKind: "group",
       userId: "member-openid-1",
       text: "hello everyone",
+      requiresReply: false,
+    });
+  });
+
+  it("requires a quote when GROUP_MESSAGE_CREATE mentions this bot", () => {
+    const result = normalizeQQMessage({
+      id: "event-group-mention-1",
+      op: 0,
+      t: "GROUP_MESSAGE_CREATE",
+      d: {
+        id: "message-group-mention-1",
+        group_openid: "group-openid-1",
+        content: "hello",
+        timestamp: "2026-09-15T00:00:00.000Z",
+        mentions: [
+          { id: "someone-else", bot: false },
+          { id: "bot-openid-1", is_you: true, bot: true },
+        ],
+        author: {
+          member_openid: "member-openid-1",
+          username: "Mikan",
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      messageId: "message-group-mention-1",
       requiresReply: true,
     });
   });

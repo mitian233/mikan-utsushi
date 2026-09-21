@@ -18,5 +18,6 @@ export interface ChatMessage {
   text?: string;
   images: Array<{ url: string; fileId?: string }>;
   replyToMessageId?: string;
+  requiresReply?: boolean;
   timestamp: number;
 }

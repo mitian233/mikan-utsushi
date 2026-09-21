@@ -39,6 +39,7 @@ describe("normalizeQQMessage", () => {
       text: "hello",
       images: [{ url: "https://multimedia.nt.qq.com/image-1", fileId: "cat.jpg" }],
       replyToMessageId: "message-before-1",
+      requiresReply: true,
     });
   });
 
@@ -66,6 +67,7 @@ describe("normalizeQQMessage", () => {
       chatKind: "group",
       userId: "member-openid-1",
       text: "hello everyone",
+      requiresReply: false,
     });
   });
 

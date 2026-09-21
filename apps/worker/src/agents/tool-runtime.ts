@@ -142,7 +142,6 @@ export const SEND_MESSAGE_TOOL_DEFINITION: ModelToolDefinition = {
       properties: {
         action: { type: "string", enum: ["send", "silent"] },
         content: { type: "string" },
-        reply_to_message_id: { type: "string" },
       },
     },
   },
@@ -275,7 +274,7 @@ const AUDIT_ARGUMENT_KEYS: Record<string, readonly string[]> = {
   conversation_search: ["query", "before", "after", "limit"],
   search_web: ["query"],
   read_web: ["url"],
-  send_message: ["action", "content", "reply_to_message_id"],
+  send_message: ["action", "content"],
 };
 
 function argumentShape(name: string, args: AuditShape): AuditShape {
@@ -470,10 +469,9 @@ export class MemoryToolRuntime implements ToolRuntime {
     if (!this.qqClient) throw new Error("send_message is unavailable");
     if (!context.chatKind || !context.chatId) throw new Error("Current QQ conversation is unavailable");
     const content = requiredString(args, "content");
-    const replyTo = args.reply_to_message_id;
-    if (replyTo !== undefined && (typeof replyTo !== "string" || replyTo.trim() === "")) {
-      throw new Error("reply_to_message_id must be a non-empty string");
-    }
+    // Reply binding is an Agent/platform concern, not a model decision. For
+    // GROUP_AT_MESSAGE_CREATE turns this is the triggering QQ message ID.
+    const replyTo = context.requiredReplyToMessageId;
 
     const existing = this.sql.exec<DeliveryRow>(
       `SELECT id, turn_id, tool_call_id, content, reply_to_message_id, status,

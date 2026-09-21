@@ -66,6 +66,7 @@ export function normalizeQQMessage(payload: QQWebhookPayload): ChatMessage | nul
       text,
       images,
       replyToMessageId: replyId,
+      requiresReply: payload.t === "GROUP_AT_MESSAGE_CREATE",
       timestamp: timestamp(data.timestamp),
     };
   }

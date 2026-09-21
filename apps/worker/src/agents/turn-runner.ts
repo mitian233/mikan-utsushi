@@ -9,6 +9,7 @@ import type {
 export interface ToolExecutionContext {
   turnId: string;
   speakerId?: string;
+  requiredReplyToMessageId?: string;
   chatKind?: "group" | "c2c";
   chatId?: string;
   signal: AbortSignal;
@@ -47,6 +48,7 @@ export type TurnDebugEvent = {
 export interface TurnRunnerContext {
   turnId: string;
   speakerId?: string;
+  requiredReplyToMessageId?: string;
   chatKind?: "group" | "c2c";
   chatId?: string;
   signal?: AbortSignal;
@@ -94,6 +96,7 @@ export async function runToolLoop(input: {
   const context: ToolExecutionContext = {
     turnId: input.context.turnId,
     speakerId: input.context.speakerId,
+    requiredReplyToMessageId: input.context.requiredReplyToMessageId,
     chatKind: input.context.chatKind,
     chatId: input.context.chatId,
     signal: controller.signal,

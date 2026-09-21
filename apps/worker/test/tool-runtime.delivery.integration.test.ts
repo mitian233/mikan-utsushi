@@ -35,6 +35,7 @@ describe("durable send_message", () => {
           chatKind: "group" as const,
           chatId: "delivery-group",
           requiredReplyToMessageId: "mention-message-1",
+          requiredQuoteReferenceId: "REFIDX_mention-1==",
           signal: new AbortController().signal,
         };
 
@@ -59,7 +60,15 @@ describe("durable send_message", () => {
     expect(result.sentCount).toEqual([1, 1]);
     expect(result.calls).toHaveLength(1);
     expect(result.transactionCount).toBe(2);
-    expect(result.calls[0]?.slice(0, 2)).toEqual([{ scope: "group", targetId: "delivery-group", replyTo: "mention-message-1" }, "reply"]);
+    expect(result.calls[0]?.slice(0, 2)).toEqual([
+      {
+        scope: "group",
+        targetId: "delivery-group",
+        replyTo: "mention-message-1",
+        quoteTo: "REFIDX_mention-1==",
+      },
+      "reply",
+    ]);
     expect(result.calls[0]?.[2]).toBeInstanceOf(AbortSignal);
     expect(result.deliveries).toEqual([{ status: "sent", platform_message_id: "qq-1", attempt_count: 1 }]);
     expect(result.messages).toEqual([

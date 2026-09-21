@@ -20,6 +20,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
     images_json TEXT NOT NULL DEFAULT '[]',
     reply_to_message_id TEXT,
     reply_required INTEGER NOT NULL DEFAULT 0,
+    quote_reference_id TEXT,
     status TEXT NOT NULL CHECK (status IN ('pending', 'batched', 'visible', 'failed')),
     timestamp INTEGER,
     created_at INTEGER NOT NULL,

@@ -10,6 +10,7 @@ export interface QQMessageTarget {
   scope: "group" | "c2c";
   targetId: string;
   replyTo?: string;
+  quoteTo?: string;
 }
 
 export type QQSendResult =

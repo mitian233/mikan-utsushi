@@ -59,7 +59,12 @@ describe("QQBotClient", () => {
       Response.json({ id: "qq-message-1" }),
     ]);
 
-    await expect(client.sendText({ scope: "group", targetId: "group/open", replyTo: "inbound-1" }, "hello"))
+    await expect(client.sendText({
+      scope: "group",
+      targetId: "group/open",
+      replyTo: "inbound-1",
+      quoteTo: "REFIDX_inbound-1==",
+    }, "hello"))
       .resolves.toEqual({ outcome: "sent", messageId: "qq-message-1" });
 
     expect(requests.map((request) => String(request.input))).toEqual([
@@ -70,6 +75,7 @@ describe("QQBotClient", () => {
       content: "hello",
       msg_type: 0,
       msg_id: "inbound-1",
+      message_reference: { message_id: "REFIDX_inbound-1==" },
     });
     expect(new Headers(requests[1]?.init?.headers).get("authorization")).toBe("QQBot token");
   });

@@ -472,6 +472,7 @@ export class MemoryToolRuntime implements ToolRuntime {
     // Reply binding is an Agent/platform concern, not a model decision. For
     // group turns this is the triggering QQ message ID (d.id as msg_id).
     const replyTo = context.requiredReplyToMessageId;
+    const quoteTo = context.requiredQuoteReferenceId;
 
     const existing = this.sql.exec<DeliveryRow>(
       `SELECT id, turn_id, tool_call_id, content, reply_to_message_id, status,
@@ -531,7 +532,12 @@ export class MemoryToolRuntime implements ToolRuntime {
     );
 
     const result = await this.qqClient.sendText(
-      { scope: context.chatKind, targetId: context.chatId, ...(replyTo ? { replyTo } : {}) },
+      {
+        scope: context.chatKind,
+        targetId: context.chatId,
+        ...(replyTo ? { replyTo } : {}),
+        ...(quoteTo ? { quoteTo } : {}),
+      },
       content,
       context.signal,
     );

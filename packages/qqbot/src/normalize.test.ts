@@ -21,6 +21,10 @@ describe("normalizeQQMessage", () => {
         message_reference: {
           message_id: "message-before-1",
         },
+        message_scene: {
+          source: "default",
+          ext: ["msg_idx=REFIDX_group-1==", "auth_token=token"],
+        },
         author: {
           member_openid: "member-openid-1",
           user_openid: "must-not-be-used-for-group",
@@ -40,6 +44,7 @@ describe("normalizeQQMessage", () => {
       images: [{ url: "https://multimedia.nt.qq.com/image-1", fileId: "cat.jpg" }],
       replyToMessageId: "message-before-1",
       requiresReply: true,
+      quoteReferenceId: "REFIDX_group-1==",
     });
   });
 

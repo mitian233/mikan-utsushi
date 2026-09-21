@@ -43,11 +43,12 @@ export class QQBotClient {
       ? `/v2/groups/${encodeURIComponent(target.targetId)}/messages`
       : `/v2/users/${encodeURIComponent(target.targetId)}/messages`;
 
-    const body: Record<string, string | number> = {
+    const body: Record<string, unknown> = {
       content,
       msg_type: 0,
     };
     if (target.replyTo) body.msg_id = target.replyTo;
+    if (target.quoteTo) body.message_reference = { message_id: target.quoteTo };
 
     try {
       const { response, payload } = await this.fetchWithTimeout(`${this.apiBase}${path}`, {

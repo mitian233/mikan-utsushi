@@ -29,6 +29,10 @@ function groupPayload(eventId = "event-group-1"): Payload {
       content: "hello",
       timestamp: "2026-09-15T00:00:00.000Z",
       author: { member_openid: "member-openid-1", username: "Mikan" },
+      message_scene: {
+        source: "default",
+        ext: [`msg_idx=REFIDX-${eventId}==`, "auth_token=token"],
+      },
     },
   };
 }
@@ -239,6 +243,7 @@ describe("QQ webhook integration", () => {
       scope: "group",
       targetId: "group-openid-1",
       replyTo: "message-e2e-group-event",
+      quoteTo: "REFIDX-e2e-group-event==",
     });
     expect(observed.deliveries).toEqual([{ tool_call_id: "e2e-send-call", status: "sent" }]);
     expect(observed.messages).toEqual([

@@ -65,8 +65,8 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
     const inserted = this.ctx.storage.sql.exec(
       `INSERT OR IGNORE INTO messages
        (event_id, message_id, direction, chat_kind, chat_id, user_id, username, text,
-        images_json, reply_to_message_id, reply_required, status, timestamp, created_at)
-       VALUES (?, ?, 'inbound', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+        images_json, reply_to_message_id, reply_required, quote_reference_id, status, timestamp, created_at)
+       VALUES (?, ?, 'inbound', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       message.eventId,
       message.messageId,
       message.chatKind,
@@ -77,6 +77,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       JSON.stringify(message.images ?? []),
       message.replyToMessageId ?? null,
       message.requiresReply ? 1 : 0,
+      message.quoteReferenceId ?? null,
       message.timestamp,
       Date.now(),
     );
@@ -282,7 +283,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
     const runtimeConfig = this.getRuntimeConfig();
     const turnRows = this.ctx.storage.sql
       .exec<StoredMessageRow>(
-        `SELECT m.id, m.message_id, m.direction, m.status, m.text, m.images_json, m.user_id, m.reply_required
+        `SELECT m.id, m.message_id, m.direction, m.status, m.text, m.images_json, m.user_id, m.reply_required, m.quote_reference_id
          FROM turn_messages tm
          JOIN messages m ON m.id = tm.message_id
          WHERE tm.turn_id = ?
@@ -292,7 +293,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
       .toArray();
     const recentRows = this.ctx.storage.sql
       .exec<StoredMessageRow>(
-        `SELECT id, message_id, direction, status, text, images_json, user_id, reply_required
+        `SELECT id, message_id, direction, status, text, images_json, user_id, reply_required, quote_reference_id
          FROM messages
          WHERE status = 'visible'
          ORDER BY created_at DESC, id DESC
@@ -322,6 +323,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
         turnId,
         speakerId: turnMessages.find((message) => message.direction === "inbound")?.userId ?? undefined,
         requiredReplyToMessageId: turnRows.find((row) => row.direction === "inbound" && row.reply_required === 1)?.message_id ?? undefined,
+        requiredQuoteReferenceId: turnRows.find((row) => row.direction === "inbound" && row.reply_required === 1)?.quote_reference_id ?? undefined,
         chatKind: conversationIdentity?.chatKind,
         chatId: conversationIdentity?.chatId,
       },
@@ -530,6 +532,7 @@ export class GroupChatAgent extends Agent<Env, Record<string, never>> {
     try { this.ctx.storage.sql.exec("ALTER TABLE turns ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0"); } catch { /* already migrated */ }
     try { this.ctx.storage.sql.exec("ALTER TABLE turns ADD COLUMN termination TEXT"); } catch { /* already migrated */ }
     try { this.ctx.storage.sql.exec("ALTER TABLE messages ADD COLUMN reply_required INTEGER NOT NULL DEFAULT 0"); } catch { /* already migrated */ }
+    try { this.ctx.storage.sql.exec("ALTER TABLE messages ADD COLUMN quote_reference_id TEXT"); } catch { /* already migrated */ }
   }
 
   private agentIdentity(): ConversationIdentity {
@@ -563,6 +566,7 @@ interface StoredMessageRow extends Record<string, string | number | null> {
   user_id: string | null;
   message_id: string | null;
   reply_required: number;
+  quote_reference_id: string | null;
 }
 
 function toContextMessage(row: StoredMessageRow): ContextMessage {

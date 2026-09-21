@@ -10,6 +10,7 @@ export interface ToolExecutionContext {
   turnId: string;
   speakerId?: string;
   requiredReplyToMessageId?: string;
+  requiredQuoteReferenceId?: string;
   chatKind?: "group" | "c2c";
   chatId?: string;
   signal: AbortSignal;
@@ -49,6 +50,7 @@ export interface TurnRunnerContext {
   turnId: string;
   speakerId?: string;
   requiredReplyToMessageId?: string;
+  requiredQuoteReferenceId?: string;
   chatKind?: "group" | "c2c";
   chatId?: string;
   signal?: AbortSignal;
@@ -97,6 +99,7 @@ export async function runToolLoop(input: {
     turnId: input.context.turnId,
     speakerId: input.context.speakerId,
     requiredReplyToMessageId: input.context.requiredReplyToMessageId,
+    requiredQuoteReferenceId: input.context.requiredQuoteReferenceId,
     chatKind: input.context.chatKind,
     chatId: input.context.chatId,
     signal: controller.signal,

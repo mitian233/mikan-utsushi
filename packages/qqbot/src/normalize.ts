@@ -37,6 +37,17 @@ function mentionsThisBot(value: unknown): boolean {
   return value.some((item) => record(item)?.is_you === true);
 }
 
+function sceneMsgIdx(value: unknown): string | undefined {
+  const ext = record(value)?.ext;
+  if (!Array.isArray(ext)) return undefined;
+  for (const item of ext) {
+    if (typeof item !== "string" || !item.startsWith("msg_idx=")) continue;
+    const idx = item.slice("msg_idx=".length).trim();
+    if (idx.length > 0) return idx;
+  }
+  return undefined;
+}
+
 function timestamp(value: unknown): number {
   if (typeof value !== "string") return Date.now();
   const parsed = Date.parse(value);
@@ -72,6 +83,7 @@ export function normalizeQQMessage(payload: QQWebhookPayload): ChatMessage | nul
       images,
       replyToMessageId: replyId,
       requiresReply: payload.t === "GROUP_AT_MESSAGE_CREATE" || mentionsThisBot(data.mentions),
+      quoteReferenceId: sceneMsgIdx(data.message_scene),
       timestamp: timestamp(data.timestamp),
     };
   }

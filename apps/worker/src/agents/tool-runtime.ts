@@ -470,7 +470,7 @@ export class MemoryToolRuntime implements ToolRuntime {
     if (!context.chatKind || !context.chatId) throw new Error("Current QQ conversation is unavailable");
     const content = requiredString(args, "content");
     // Reply binding is an Agent/platform concern, not a model decision. For
-    // GROUP_AT_MESSAGE_CREATE turns this is the triggering QQ message ID.
+    // group turns this is the triggering QQ message ID (d.id as msg_id).
     const replyTo = context.requiredReplyToMessageId;
 
     const existing = this.sql.exec<DeliveryRow>(

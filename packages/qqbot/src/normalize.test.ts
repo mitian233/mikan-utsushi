@@ -43,7 +43,7 @@ describe("normalizeQQMessage", () => {
     });
   });
 
-  it("normalizes a QQ group message in receive-all mode", () => {
+  it("treats GROUP_MESSAGE_CREATE as a quote-required group mention", () => {
     const result = normalizeQQMessage({
       id: "event-group-all-1",
       op: 0,
@@ -67,7 +67,7 @@ describe("normalizeQQMessage", () => {
       chatKind: "group",
       userId: "member-openid-1",
       text: "hello everyone",
-      requiresReply: false,
+      requiresReply: true,
     });
   });
 

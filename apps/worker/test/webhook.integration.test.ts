@@ -134,6 +134,25 @@ describe("QQ webhook integration", () => {
     });
   });
 
+  it("persists GROUP_MESSAGE_CREATE as reply-required so passive quote works", async () => {
+    const payload = {
+      ...groupPayload("event-group-message-create"),
+      t: "GROUP_MESSAGE_CREATE",
+    };
+    expect((await sendWebhook(payload)).status).toBe(200);
+
+    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+    const stub = namespace.get(namespace.idFromName("qq:group:group-openid-1"));
+    const rows = await runInDurableObject(stub, (_agent, state) =>
+      state.storage.sql.exec("SELECT event_id, message_id, reply_required FROM messages").toArray(),
+    );
+    expect(rows).toEqual([{
+      event_id: "event-group-message-create",
+      message_id: "message-event-group-message-create",
+      reply_required: 1,
+    }]);
+  });
+
   it("runs a webhook-created group message through batching and one durable delivery", async () => {
     expect((await sendWebhook(groupPayload("e2e-group-event"))).status).toBe(200);
     const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
@@ -193,12 +212,18 @@ describe("QQ webhook integration", () => {
       await agent.runTurn({ turnId });
       return {
         sendCalls: sendText.mock.calls.length,
+        sendTarget: sendText.mock.calls[0]?.[0],
         deliveries: state.storage.sql.exec("SELECT tool_call_id, status FROM outbound_deliveries").toArray(),
         messages: state.storage.sql.exec("SELECT direction, status, text FROM messages ORDER BY id").toArray(),
       };
     });
 
     expect(observed.sendCalls).toBe(1);
+    expect(observed.sendTarget).toMatchObject({
+      scope: "group",
+      targetId: "group-openid-1",
+      replyTo: "message-e2e-group-event",
+    });
     expect(observed.deliveries).toEqual([{ tool_call_id: "e2e-send-call", status: "sent" }]);
     expect(observed.messages).toEqual([
       { direction: "inbound", status: "visible", text: "hello" },

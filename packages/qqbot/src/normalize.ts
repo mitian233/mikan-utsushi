@@ -66,7 +66,9 @@ export function normalizeQQMessage(payload: QQWebhookPayload): ChatMessage | nul
       text,
       images,
       replyToMessageId: replyId,
-      requiresReply: payload.t === "GROUP_AT_MESSAGE_CREATE",
+      // QQ may push @-bot group messages as GROUP_MESSAGE_CREATE even when
+      // receive-all is off. Passive reply still needs d.id as msg_id.
+      requiresReply: true,
       timestamp: timestamp(data.timestamp),
     };
   }

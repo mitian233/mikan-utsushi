@@ -2,7 +2,7 @@
 
 日期：2026-10-03
 
-状态：六批实现、本地门禁与独立 workerd smoke 全部完成；按依赖、运行时/测试、验收文档三组归档。生产上线切换另行规划。
+状态：初始六批已归档；旧库原位升级、同库覆盖启动、二次重启和最终全仓门禁全部通过。尚未生产部署。
 
 分支：`feat/pi-durable-runtime`
 
@@ -12,7 +12,7 @@
 
 以 `@earendil-works/pi-durable` 替换项目自研的模型/工具循环，让已接受的聊天轮次在 Durable Object 重启后能够恢复模型和工具任务。保留现有 QQ 产品行为、安全边界及每个会话自己的 SQLite。
 
-本次按全新数据库完成真实 Workers 接入、故障恢复和契约验证，不导入旧数据、不实现旧 schema 或旧运行状态兼容。上线切换与旧数据库处置在运行时验收完成后另行规划。后台研究、多 Agent 协作、steering 指令、自动摘要、管理页面及新模型协议属于未来功能，不随迁移增加。
+第一阶段按全新数据库完成真实 Workers 接入、故障恢复和契约验证；第二阶段增加下方「旧库原位升级」的一次性迁移，支持保持 namespace 覆盖部署。生产执行与数据恢复见部署说明。后台研究、多 Agent 协作、steering 指令、自动摘要、管理页面及新模型协议不随迁移增加。
 
 本次以迁移前现行行为为基线：只有显式 `send_message(send|silent)` 才能正常终止，`MODEL_MAX_ROUNDS` 默认 6。旧设计/实施计划中的“无工具即结束”“不限制轮数”与当前行为的差异已统一修订。
 
@@ -86,7 +86,7 @@ QQ webhook
 
 ### 第二批：Durable Objects SQLite adapter 与恢复宿主
 
-涉及：按全新数据库设计重写 `apps/worker/src/agents/schema.ts`；建议新文件 `pi-storage.ts`、`pi-runtime.ts` 及对应 Workers 集成测试。初始化只支持新结构，不读取或升级旧 schema。
+涉及：初始按全新数据库设计重写 `apps/worker/src/agents/schema.ts`，新增 `pi-storage.ts`、`pi-runtime.ts` 及对应 Workers 集成测试。当前旧库导入由下方后续阶段补充。
 
 - [x] 实现 0.99.2 同步 exec/prepare/run/get/all/transaction/close 合同，复用便携 SqliteStorage；cursor 同步消费。
 - [x] 以 DO transactionSync 适配 SDK 同步 commit；失败回滚，async callback 拒绝，禁止手写 BEGIN/SAVEPOINT。
@@ -130,7 +130,7 @@ QQ webhook
 涉及：`group-chat-agent.ts`、全新 `schema.ts`、Worker 集成测试、provider exports/callers；此批不执行上线切换或旧库处置。
 
 - [x] executeTurn 接入真实 Pi Harness，删除旧 loop 模块、测试与无用结果字段；迁移全部调用者。
-- [x] 使用新业务表和 Pi 表；旧库初始化拒绝，不导入旧状态或建立兼容分支。
+- [x] 完成新业务表和 Pi 表的主链路切换；当前旧库通过后续一次性导入进入新结构，不保留旧运行时或双写分支。
 - [x] qq_events 墓碑、原子不可变消息批次、FIFO qq_turns、期限/预算 qq_attempts 和 Pi link 已接入主链路。
 - [x] 稳定 request ID 与单个串行处理器覆盖 attempt/link/submission 创建和结果收敛。
 - [x] active turn 恢复原检查点；已有终止屏障直接收敛，不重新生成回答。
@@ -182,6 +182,15 @@ git diff --check
 
 每批交付提供准确变更范围、失败测试与通过结果、实际 smoke 证据和剩余限制。SDK 异常需要报告具体证据，不通过禁用错误、扩大权限或假实现绕过。
 
-此前 8–15 人日估算包含旧状态衔接，本次移除该项。Workers adapter、副作用恢复和执行正文清理现已通过实际验收；生产切换与旧数据处置属于后续独立范围。
+此前 8–15 人日估算包含旧状态衔接；初始六批移除了此项，现在旧库衔接也已实现并完成同库覆盖启动验证。生产发布、备份和必要的数据恢复仍是单独操作。
 
-本阶段实施全新数据库运行时并完成本地验收；没有生产部署、凭据写入、旧数据导入或数据库清空。GitHub 研究源码与实际锁定 SDK 的版本差异、门禁结果和 smoke 证据均在[验收报告](../../acceptance-report.md)记录。
+初始六批实现和旧库升级均只操作本地合成数据库；没有生产部署、凭据写入或生产数据库清空。固定版本 SDK 门禁与同库升级证据见[验收报告](../../acceptance-report.md)。
+
+## 后续阶段：旧库原位升级
+
+- [x] 三项旧库测试先观察到空库拒绝的预期失败；损坏审计值另有失败再修复的回归验证。
+- [x] 在构造阶段单事务迁移身份、聊天/事件、Memory、UUID/FIFO、终态屏障及历史审计/debug；旧表仅在成功提交时移除。
+- [x] 保留 pending/queued/retry_wait、尝试计数与 SDK retry deadline；旧 running 无终止证据时保守失败，不制造 Pi 检查点或重放未知副作用。
+- [x] 验证 confirmed 历史补齐、多次输出、ID 不复用、可选旧列、C2C/成员范围、结构/身份/混合库/审计错误回滚；12 项专项 Workers 测试通过。
+- [x] 独立 workerd 使用同一 Worker/class/namespace/SQLite，旧入口写库后停止，新入口自动导入并通过原生 alarm 完成后续批次；二次进程重启模型计数不变、QQ 0 次，旧事件 duplicate=true。
+- [x] 更新当前数据设计、架构、部署前提与数据回滚限制；实际全仓结果在验收报告记录。

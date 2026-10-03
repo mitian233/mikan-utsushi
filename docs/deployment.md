@@ -2,7 +2,7 @@
 
 本清单说明如何把 `mikan-utsushi` 部署到一个 Cloudflare 账号并连接一个 QQ 机器人。
 
-当前 Pi Durable 实现只支持全新会话数据库。旧数据库会被初始化拒绝；本清单不能作为覆盖旧部署的切换方案。namespace/binding 切换、旧数据处置与代码回滚的数据兼容需在本地验收后另行规划，见 [运行时迁移计划](superpowers/plans/2026-10-03-pi-durable-runtime-migration.md)。
+当前支持直接覆盖旧项目：每个旧 SQLite Durable Object 首次加载新代码时自动、原子地升级业务表；休眠会话在下一次回调或 alarm 唤醒时升级。空库和已升级实例仍可正常启动。完整数据策略见 [数据库设计](superpowers/specs/2026-10-03-pi-durable-database-design.md)。
 
 执行前请确认：**部署会使用真实凭据并对外提供回调端点**。请先完成本地冒烟测试，并确认你已获得部署授权。
 
@@ -74,6 +74,18 @@ pnpm exec wrangler deploy
 ```
 
 首次部署会自动创建 `GroupChatAgent` 的 SQLite-backed Durable Object（`migrations` 中已声明 `v1`）。
+
+### 覆盖旧项目
+
+1. 保持原 Cloudflare 账号、Worker 名称 `mikan-utsushi`、实际部署环境、`GROUP_CHAT_AGENT` binding、`GroupChatAgent` 类和既有 namespace；Agent 名称保持 `qq:group:*` / `qq:c2c:*`。这些配置改变可能指向其他数据库。本次是应用表迁移，无须改已有 `migrations.v1`、创建 namespace 或重设 Secret/QQ 回调。
+2. 在发布前保留旧代码版本、记录升级前时间，并确认原 DO 的备份/PITR 可恢复。完成上述门禁后，部署包含本次迁移的版本；不要将不理解新表的旧版本长期混入流量，也不要清空旧库。部署命令仍是本节的 `pnpm exec wrangler deploy`，实际生产执行需要授权。
+3. 每个会话在同一个 `transactionSync` 中完成身份检查、聊天/Memory/账本/审计导入与旧表移除。失败保留旧库，不确认失败回调；只有成功提交后才启动新队列。未启动的会话不会在部署时被全量扫描。
+4. 检查 `qq_identity`、`qq_legacy_turn_ids`、聊天与 Memory、发送屏障和队列推进。旧 running 且没有终止证据的批次会以 `legacy_interrupted` 失败；它不会自动重跑。旧 planned 迁为 unknown，可能缺一条回复，但不会自动补发。
+5. 升级不可通过单独回滚 Worker 代码撤销：成功后旧业务表已移除，旧代码会重新建空表。回滚必须配套恢复各 DO 升级前的数据库/备份，并处理恢复点之后已发生的 QQ 发送与新事件；数据库恢复不能撤销外部消息，不能无条件重放。
+
+UUID 与整数 turn ID 可用 `SELECT legacy_id,turn_id FROM qq_legacy_turn_ids` 查询对应关系。历史原始调试记录在 `qq_legacy_turn_debug`（`attempt`、`payload_json`），当前新尝试的 debug 仍在 `qq_turn_debug`；两者均不进入普通日志或模型上下文。
+
+Cloudflare 的[类迁移](https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/)与应用 SQL 表升级是不同层次；[SQLite storage/PITR 文档](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)说明原子事务与恢复能力。本项目没有执行生产备份、部署或恢复操作。
 
 ## 5. 在 QQ 开放平台注册回调
 

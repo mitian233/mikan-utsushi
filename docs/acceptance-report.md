@@ -1,6 +1,6 @@
 # Pi Durable 运行时验收报告
 
-日期：2026-10-03。分支：`feat/pi-durable-runtime`。本报告替代自研工具循环的旧 MVP 验收结论，记录全新数据库接入、恢复与本地验证；生产切换另行规划。
+日期：2026-10-03。分支：`feat/pi-durable-runtime`。本报告记录 Pi Durable 接入、恢复、旧库原位升级与本地验证；没有执行生产部署或操作生产数据库。
 
 ## 实现与固定版本
 
@@ -17,8 +17,8 @@
 | 命令 | 结果 |
 | --- | --- |
 | `pnpm typecheck` | 全部 5 个包通过 |
-| `pnpm test` | 186 项通过：Worker 106、model-provider 18、qqbot 22、web-tools 40；contracts 无测试文件，正常退出 |
-| `pnpm --filter @mikan-utsushi/worker exec wrangler deploy --dry-run` | 通过；3784.76 KiB，gzip 695.87 KiB；未部署 |
+| `pnpm test` | 198 项通过：Worker 118、model-provider 18、qqbot 22、web-tools 40；contracts 无测试文件，正常退出 |
+| `pnpm --filter @mikan-utsushi/worker exec wrangler deploy --dry-run` | 通过；3801.63 KiB，gzip 699.91 KiB；未部署 |
 | `git diff --check` | 通过，exit 0，无空白错误；仅 Windows LF/CRLF 转换提示 |
 
 Worker 测试固定 `maxWorkers: 1`。首次默认并发运行时，74 项 Worker 测试通过，但另有 7 个测试进程在启动阶段发生 `ECONNRESET`，整次门禁失败；限制并发后全部测试文件通过，没有删除测试或缩小执行范围。
@@ -89,9 +89,29 @@ Harness 关闭/重开场景：中断请求后物理请求计数为 2，但逻辑
 
 Smoke 入口、配置、独立 SQLite、临时服务均已删除或停止；未进入提交。
 
+## 旧库原位升级验收
+
+专项命令：`pnpm --filter @mikan-utsushi/worker exec vitest run test/legacy-migration.integration.test.ts test/legacy-upgrade-edge.integration.test.ts`，2 个文件、12 项通过。三项初始用例先观察到 `Pi runtime requires a fresh conversation database` 的预期失败；隐藏原始字符串的审计 valueLengths 也先观察到未拒绝的失败，再增加值形状检查并通过。完整全仓门禁结果见上表；Worker 21 个文件、118 项通过。
+
+覆盖身份/KV 一致性、混合库拒绝与事务回滚、历史聊天和 UUID/FIFO、Memory scope、事件去重、删除后 AUTOINCREMENT 水位、旧可选列、发送屏障、多条历史输出、confirmed 中断补齐、不恢复 retention 已删除聊天、audit/debug、旧 retry schedule 截止时间、实际 Harness 推进与成员 Memory 隔离。
+
+独立 smoke 命令为 `node node_modules/wrangler/bin/wrangler.js dev --config .legacy-smoke/wrangler.jsonc --local --port 8794`。旧入口使用迁移前 DDL、同一 Worker 名称和 GroupChatAgent class/binding，给群聊和 C2C 各写入 planned/running/retry_wait/queued/pending 与 Memory，然后停止进程。旧受控 retry 回调曾触发预期失败且不改业务状态；新入口读取原 SQLite 文件，实际构造器自行导入，无手动调用迁移、复制库或直接推进队列。
+
+| 每个会话的观察 | 首次新入口加载 | 原生 alarm 收敛后 | 再次进程重启后 |
+| --- | --- | --- | --- |
+| 旧业务表 | 已移除 | 无 | 无 |
+| old planned | completed / sent 终止，ledger=outcome_unknown | 同左，正文 null | 同左 |
+| 无 checkpoint 的 old running | failed / legacy_interrupted | 同左 | 同左 |
+| retry / queued / pending | retry_wait / queued / 待批处理 | 三批均 completed / silent，attempt=2/1/1 | 同左 |
+| Memory | 原 ID、正文与 user:member 范围保留 | 1 条 | 1 条 |
+| 受控模型 HTTP / QQ 请求 | 0 / 0 | 6 / 0 | 6 / 0 |
+| 输入快照 / 调度 | 尚未创建尝试 / flush+wake | 三份均 null / 空 | 三份均 null / 空 |
+
+旧事件在群聊和 C2C 各重送一次，均返回 accepted=true / duplicate=true。没有为无检查点旧任务创建 Pi checkpoint，也未对未知 QQ 发送补发。本地结果证明同库覆盖启动、调度接续与迁移幂等性；不能证明生产数据规模、其他未知旧 schema 或真实平台服务行为。
+
 ## 部署与验证限制
 
-- 当前初始化只支持全新数据库，遇到旧 schema 会拒绝。本次没有旧数据兼容、导入、清空或生产 namespace/binding 切换。
+- 当前支持空库和迁移前主线旧业务 schema 的原位升级；本次只使用独立本地合成旧库，没有导入、清空或操作任何生产数据库。覆盖部署前提和配套数据恢复见 deployment.md。
 - 没有生产部署、登录、Wrangler Secret 写入或真实 QQ/LLM/Exa 调用。真实凭据、频控、回调注册和平台服务行为不由合成 smoke 证明。
 - Pi SDK 为 Experimental，固定版本的同步存储和清理实现不能直接套用后续版本；升级必须重新验证。
 - 显式 `TURN_DEBUG_ENABLED=true` 会保留原始敏感正文；它与默认审计分开，不参与可见聊天 retention，需要按部署排障流程手动关闭/清理。

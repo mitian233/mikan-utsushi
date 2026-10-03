@@ -1,16 +1,16 @@
-# Pi Durable 全新数据库设计
+# Pi Durable 数据库设计与旧库升级
 
 日期：2026-10-03
 
-状态：空库结构、持久恢复、副作用屏障和执行正文清理已实现，并通过本地 Workers 门禁与独立 workerd smoke；未生产上线，未操作旧数据库。
+状态：新结构、持久恢复、副作用屏障、执行正文清理与旧库原位升级均已实现，并通过本地 Workers 场景及独立 workerd smoke；未生产上线，未操作生产数据库。
 
 分支：`feat/pi-durable-runtime`
 
 ## 设计范围
 
-按全新 SQLite 数据库设计，不导入旧表、旧聊天、旧 Memory、旧发送账本或旧运行状态，不实现旧 schema 的升级/兼容分支。数据库初始化只建立本设计和固定版本 Pi 所需的结构。
+初始阶段按全新 SQLite 数据库设计；当前增加迁移前主线 `9cfb347` 业务库的原位一次性导入。无版本号旧表转换为本文件的 schema_version=1；已升级和空库的运行合同保持一致，不保留旧运行时或双写路径。
 
-本文件设计运行时数据。上线切换、旧数据库处置、回调切换和切换期间事件处理，在新运行时完成本地验收后另行规划；当前不选择上线方案，也不清空任何数据库。
+本文件设计运行时数据与旧库导入。覆盖部署保持原 Worker/namespace/binding，无须创建新 DO 类或修改已发布的 Wrangler `migrations.v1`；生产执行、备份和数据库恢复见 [部署说明](../../deployment.md)，本地验证不操作生产数据。
 
 每个 QQ 群或 C2C 对话仍对应一个 DO，名称为 `qq:group:{group_openid}` / `qq:c2c:{user_openid}`。一个 DO 只保存这个对话的数据，群成员与 C2C 身份不合并。
 
@@ -323,4 +323,26 @@ Pi 没有通用历史删除接口。清理使用固定版本 schema 的 adapter 
 
 ## 实施衔接
 
-[实施计划](../plans/2026-10-03-pi-durable-runtime-migration.md)记录六批工作；本地运行证据见[验收报告](../../acceptance-report.md)。上线迁移、旧库处置与回滚兼容仍需独立规划，本次不选择生产切换方案。
+[实施计划](../plans/2026-10-03-pi-durable-runtime-migration.md)记录初始六批和旧库原位升级；本地运行证据见[验收报告](../../acceptance-report.md)。生产覆盖部署与数据回滚步骤见[部署说明](../../deployment.md)。
+
+## 旧库原位升级
+
+`initializeSchema(storage, identity)` 在构造阶段的单个 `transactionSync` 内创建目标结构并调用 `migrateLegacyDatabase`，先验证旧 KV 身份、所有消息的会话身份和核心表完整性。旧表与已有非空新业务表并存时拒绝合并。任一步失败都回滚；仅完整导入成功才移除旧业务表和旧应用 KV 调度标记，SDK/平台表不参与删除。成功后旧表不存在，再次初始化不会重复导入。
+
+| 源数据 | 目标与策略 |
+| --- | --- |
+| UUID turns | 按 `(created_at,id)` 建立整数 ID，`qq_legacy_turn_ids` 保存旧 UUID → 新 ID；保留尝试计数和原 FIFO |
+| pending / queued | 保留收件箱或不可变批次，交由现有调度继续执行 |
+| retry_wait | 保留原计数；启动通过 SDK 的旧 retryTurn schedule 恢复截止时间，再取消旧回调并安排 wakeProcessor；缺失 schedule 时用旧 started_at + 120 秒 + 既定重试延迟兜底 |
+| running 无终止证据 | 标记 failed / legacy_interrupted；没有可移植的 Pi checkpoint，不自动重跑可能已写 Memory 的工具 |
+| sent / unknown / planned | 保留 turn 级屏障；planned → outcome_unknown / legacy_planned_recovery，未知状态不创造可见回复 |
+| completed / failed | 保留终态；旧 completed 无显式 termination 且无发送证据时按历史静默记账；failed 即使已有发送屏障也不重新执行 |
+| messages | 保留数值 ID、时间、图片、用户、reply/quote 和批次位置；现存 event ID 进入 qq_events；保存 sqlite_sequence 水位，已删除的高 ID 不复用 |
+| 多条历史 outbound | 保留全部可见记录，额外输出使用只读终态历史 turn；不恢复已被 retention 清理的终态聊天；中断中的 confirmed send 可用已确认账本补齐历史 |
+| memories | ID/正文/source_message_id/时间不变，group → group/空 owner，user:<openid> → user/完整 owner；未知或空 scope 拒绝 |
+| tool_calls | 原 sha256 标识与有界元数据进入 qq_tool_audit；JSON、字段与值形状必须为实际脱敏摘要，拒绝隐藏原始内容 |
+| turn_debug | 原显式 debug 内容进入 qq_legacy_turn_debug，不制造历史模型配置或 qq_attempts，不转入模型输入或普通日志 |
+
+旧库专用表仅在成功导入时创建：`qq_legacy_turn_ids(legacy_id,turn_id)`、`qq_legacy_deliveries(legacy_id,turn_id,tool_call_id,status,platform_message_id,send_attempts,created_at,updated_at)`、`qq_legacy_turn_debug(id,turn_id,attempt,round,event,payload_json,created_at)`。账本归档不复制发送正文或原 last_error。遗留屏障的正整数 tool_task_id 是迁移 turn ID 派生的本地 surrogate，不代表 Pi task；不会写入伪造 SDK 任务。可恢复的 payload_hash 按当前正文/reply/null quote 计算 SHA-256；只有发送事实而无正文时使用迁移 turn ID 的 provenance hash，仍永久阻止重发。
+
+迁移不是可逆 schema 兼容层。成功后仅回滚代码会重新创建空旧表；恢复旧版本必须同时恢复升级前的数据，并单独处理恢复点之后的外部 QQ 副作用与新事件。旧库已清理的历史正文及 event ID 无法凭迁移重建。

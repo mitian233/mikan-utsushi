@@ -30,11 +30,24 @@ export class GroupChatAgent extends Agent<Env,Record<string,never>> {
 
   constructor(ctx:DurableObjectState,env:Env) {
     super(ctx,env);
-    initializeSchema(ctx.storage);
+    initializeSchema(ctx.storage,this.agentIdentity());
   }
 
   async onStart():Promise<void> {
-    // The constructor initializes SQL before SDK recovery hooks or direct RPC.
+    // SQL conversion completes in the constructor before any recovery or RPC.
+    // Persist retry deadlines before canceling legacy callbacks; a restart can
+    // then reconstruct the new wakeup even if the handoff was interrupted.
+    const schedules=await this.listSchedules();
+    const legacyMapping=this.ctx.storage.sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='qq_legacy_turn_ids'").toArray().length > 0;
+    for (const schedule of schedules) {
+      if (schedule.callback !== "runTurn" && schedule.callback !== "retryTurn") continue;
+      const payload=schedule.payload;
+      if (legacyMapping && schedule.callback === "retryTurn" && typeof payload === "object" && payload !== null && "turnId" in payload && typeof payload.turnId === "string") {
+        this.ctx.storage.sql.exec(`UPDATE qq_turns SET retry_at=MIN(retry_at,?) WHERE status='retry_wait'
+          AND id=(SELECT turn_id FROM qq_legacy_turn_ids WHERE legacy_id=?)`,schedule.time*1000,payload.turnId);
+      }
+      await this.cancelSchedule(schedule.id);
+    }
     await this.arrangeWork();
   }
 

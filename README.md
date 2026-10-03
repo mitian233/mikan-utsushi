@@ -1,6 +1,6 @@
 # mikan-utsushi
 
-Cloudflare Workers + Agents + Pi Durable QQ 群聊/C2C 聊天伙伴运行时。当前实现只支持全新会话数据库；旧数据库的上线切换与处置需另行规划。
+Cloudflare Workers + Agents + Pi Durable QQ 群聊/C2C 聊天伙伴运行时。支持空库初始化与旧版 SQLite 会话库的原位一次性升级；保持原 Worker、DO namespace 和 Agent 身份，覆盖部署步骤见 [部署说明](docs/deployment.md)。
 
 ## 已实现能力
 
@@ -11,6 +11,7 @@ Cloudflare Workers + Agents + Pi Durable QQ 群聊/C2C 聊天伙伴运行时。�
 - 只有独立的 `send_message(action=send|silent)` 正常终止尝试；普通 assistant 文本继续执行，混合终止响应整轮拒绝。
 - 支持 vision 图片输入、隔离 Memory、Exa `search_web` 和受限 direct-fetch `read_web`。
 - 可见聊天按配置数量清理；`qq_events` 去重墓碑、Memory、业务结果、发送屏障和 `qq_tool_audit` 脱敏审计保留。业务终态后清除私有 Pi 执行正文与输入快照。
+- 旧库升级保留现存聊天、Memory、事件去重与发送屏障；未执行批次和业务重试继续处理，无 Pi 检查点的旧 running 任务标记为 `legacy_interrupted`，不自动重放副作用。
 
 Pi 依赖固定为 `@earendil-works/pi-durable`、`pi-ai`、`chord` 的 `0.99.2`，SDK 仍为 Experimental。每次尝试持久保存 120 秒绝对期限与 `MODEL_MAX_ROUNDS`（默认 6）；重启恢复原任务，不重置期限或逻辑轮数。
 

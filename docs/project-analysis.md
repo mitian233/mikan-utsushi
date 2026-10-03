@@ -45,7 +45,7 @@ Pi Durable、Pi AI、Chord 固定为 `0.99.2`，Agents 固定为 `0.23.0`。SDK 
 
 本次验证只使用合成凭据、受控 HTTP 返回及独立本地 SQLite。全仓测试、typecheck、Wrangler dry-run 和独立 workerd smoke 的准确结果见 [验收报告](acceptance-report.md)。Worker 测试并发固定为 1，避免 Windows 下同时启动大量 workerd 导致连接重置。
 
-当前代码只支持全新会话数据库，初始化会拒绝旧 schema。本次未导入、清空或操作旧数据，也未部署、发布回调或调用真实 QQ/LLM/Exa。生产 namespace/binding 切换、旧库处置和回滚兼容需另行制定方案。
+当前支持空库初始化，以及迁移前主线 `9cfb347` 的 SQLite 会话库原位一次性升级。构造阶段同步迁移旧业务表，保留现存聊天、Memory、事件与发送屏障；queued/pending/retry_wait 继续处理，无 Pi 检查点的旧 running 任务保守失败。已在本地同 namespace、同 SQLite 文件验证覆盖启动和二次进程重启；未操作生产数据、部署或调用真实 QQ/LLM/Exa。覆盖部署前提与数据回滚边界见 [部署说明](deployment.md)。
 
 ## 相关文档
 

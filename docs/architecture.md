@@ -55,7 +55,7 @@ The callback body is always read as raw bytes before verification. Web content a
 
 ## Persistence boundary
 
-Each stable Agent owns one fresh SQLite database. Names remain `qq:group:{group_openid}` and `qq:c2c:{user_openid}`. No old schema/data import or compatibility path is implemented; initialization rejects a legacy database. Production namespace/binding cutover and old-data disposition require a separate rollout plan. D1, R2 and external queues remain outside the architecture.
+Each stable Agent owns one SQLite database under `qq:group:{group_openid}` or `qq:c2c:{user_openid}`. Initialization supports both a fresh database and the pre-Pi application's unversioned SQLite schema. The existing Worker, class, binding and namespace stay in place. D1, R2 and external queues remain outside the architecture.
 
 Pi Durable, Pi AI and Chord are pinned to `0.99.2`; Agents is pinned to `0.23.0`. These SDK paths are exercised in workerd. The installed Pi version uses synchronous SQLite transactions: `DurableSqliteDatabase` consumes cursors synchronously and wraps each storage commit in `transactionSync`, rejects async transaction callbacks, and closes only its SDK handle. Research against the later 1.0.0 source does not define this adapter's API.
 
@@ -64,6 +64,10 @@ Each business attempt has an isolated Pi conversation. Conversation creation and
 The default budget is six logical generation tasks and a persisted 120-second deadline. Restarting a generation preserves its identity and remaining time. Provider and Pi automatic retries and compaction are disabled. Business failures retry after 5/30/120 seconds. Ordinary model text continues through `onYield`; only a single send/silent call terminates normally, and mixed terminal rounds execute no effects.
 
 Memory writes and replay receipts commit together. QQ planned/sent/unknown/silent barriers are keyed by business turn, so a changed task or call ID cannot create a new send allowance. Recovery converts an abandoned plan to unknown; it never retries a successful or uncertain send.
+
+Legacy import runs inside the constructor's synchronous storage transaction, before lifecycle recovery or RPC. UUID turns receive integer IDs in the original FIFO order, with durable `qq_legacy_turn_ids` mappings. Message IDs and their AUTOINCREMENT watermark, existing event IDs, scoped Memory and bounded audit metadata survive. Opted-in old debug traces move to `qq_legacy_turn_debug`; legacy ledger metadata remains in `qq_legacy_deliveries`. Retained-away chat is not resurrected. Multiple historical outputs use additional settled historical turns to satisfy the new one-output-per-delivery constraint.
+
+Queued/pending work continues. Retry budgets survive; startup imports the persisted SDK retry deadline and cancels old callbacks through the public scheduler API. A missing schedule uses the old start time plus its maximum attempt duration and retry delay. Old running work has no Pi checkpoint and fails with `legacy_interrupted`, unless a terminal send/silent record already permits settlement. Sent, unknown and abandoned planned sends remain barriers. Migration creates no fictitious Pi attempts, conversations or tasks; legacy barrier task IDs are local positive surrogates derived from their migrated turn IDs. Original tables and obsolete application KV markers are removed only on successful commit; structural, identity or mixed-source errors roll back. Deployment and restore constraints are in [deployment.md](deployment.md).
 
 ## Configuration and retention
 

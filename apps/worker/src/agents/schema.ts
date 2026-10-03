@@ -1,8 +1,11 @@
+import type { ConversationIdentity } from "./runtime-types";
+import { migrateLegacyDatabase } from "./legacy-migration";
+
 export type MessageStatus = "pending" | "batched" | "visible" | "failed";
 export type TurnStatus = "queued" | "active" | "retry_wait" | "completed" | "failed";
 export type DeliveryStatus = "planned" | "sent" | "failed" | "outcome_unknown" | "silent";
 
-/** Fresh application schema; Pi and cf_agents tables are owned by their SDKs. */
+/** Application schema; Pi and cf_agents tables are owned by their SDKs. */
 export const SCHEMA_STATEMENTS: readonly string[] = [String.raw`
 CREATE TABLE IF NOT EXISTS qq_identity (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -176,11 +179,10 @@ CREATE TABLE IF NOT EXISTS qq_turn_debug (
 CREATE INDEX IF NOT EXISTS qq_debug_by_turn ON qq_turn_debug (turn_id, id);
 `];
 
-export function initializeSchema(storage: DurableObjectStorage): void {
+export function initializeSchema(storage: DurableObjectStorage, identity?: ConversationIdentity): void {
   storage.transactionSync(() => {
-    const legacy = storage.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('messages','turns','turn_messages','outbound_deliveries','memories') LIMIT 1").toArray();
-    if (legacy.length) throw new Error("Pi runtime requires a fresh conversation database");
     for (const statement of SCHEMA_STATEMENTS) storage.sql.exec(statement).toArray();
+    migrateLegacyDatabase(storage,identity);
     const version = storage.sql.exec<{schema_version:number}>("SELECT schema_version FROM qq_identity WHERE singleton = 1").toArray()[0]?.schema_version;
     if (version !== undefined && version !== 1) throw new Error("Unsupported QQ schema version");
   });

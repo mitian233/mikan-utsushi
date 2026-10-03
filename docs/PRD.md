@@ -1,6 +1,6 @@
 # mikan-utsushi QQ 聊天伙伴 PRD
 
-**版本：** MVP Frozen 2026-09-15
+**版本：** Pi Durable 全新数据库运行时，2026-10-03。生产切换与旧数据处置另行规划。
 
 ## 产品定义
 
@@ -13,11 +13,11 @@
 - 接收并验证 QQ 官方 Webhook。
 - 支持群聊 `GROUP_AT_MESSAGE_CREATE` / `GROUP_MESSAGE_CREATE` 与私聊 `C2C_MESSAGE_CREATE`。
 - 在确认 Webhook 前持久化受支持消息，并按事件 ID 去重。
-- 空闲会话在首条消息后等待两秒形成首个模型轮次；模型轮次处于 queued、running 或 retry_wait 期间到达的消息持续积累，并在该轮次结束后合并为一个后续模型轮次。
+- 第一条 pending 消息确定固定两秒的批处理窗口；运行期间的新消息仍按自己的窗口形成后续不可变批次，轮次按 FIFO 执行。
 - 每个群聊或私聊拥有独立的 Agent、SQLite、历史记录和 Memory。
 - 通过用户指定的 OpenAI-compatible Chat Completions 接口调用模型。
-- 支持模型 Function Calling，并由模型主动结束轮次。
-- 通过 `send_message` 发送零条、一条或多条 QQ 纯文本消息。
+- Pi Harness 持久保存模型与工具执行位置，并经项目 adapter 调用 Function Calling。
+- 每个业务 turn 只有一个终止动作：`send_message(action=send)` 发送一条文本，或 `send_message(action=silent)` 静默结束。
 - 通过开关控制是否把 QQ 图片 URL 交给多模态模型。
 - 提供显式 Memory 搜索、写入、更新和删除工具。
 - 使用 Exa 执行网页搜索。
@@ -41,9 +41,9 @@ Agent 唯一标识：
 
 QQ 侧决定哪些事件会触发 Webhook。云端接受全部合法回调，对受支持消息执行持久化、合并和处理，不增加 @、关键词、概率或冷却等产品级前置规则。
 
-模型拥有是否发送消息的决定权。普通 assistant 文本不会自动发到 QQ，只有 `send_message` 工具会产生发送行为。提示词要求模型非必要不要把一条回复拆成多条，但允许接龙等自然需要连续发送的场景。
+模型拥有是否发送消息的决定权。只有 `send_message` 能产生 QQ 输出；普通 assistant 文本触发继续执行，不能代替显式终止。包含终止调用的响应只能有这一个工具；混合响应中的所有工具均被拒绝。
 
-历史上下文只包含聊天参与者实际可见的收发消息。内部工具调用、重试、错误和旧工具结果不进入后续聊天上下文；工具调用仍会持久化到 Agent 私有 SQLite 的 `tool_calls` 审计表。
+历史上下文只包含聊天参与者实际可见的收发消息。旧工具结果、重试、错误和未发送文本不进入后续上下文。`qq_tool_audit` 保留有界脱敏摘要；Pi 私有执行数据仅在尝试执行及恢复期间保留。
 
 ## 模型与图片
 
@@ -109,12 +109,15 @@ apps/worker/src/prompts/system-prompt.md
 
 - Webhook 只有在消息持久化并安排处理后才返回成功。
 - 合法但不支持的事件直接确认，不进入 Agent。
-- 重复事件直接确认，不重复调用模型或发送消息。
-- 同一 Agent 的轮次按 FIFO 顺序处理，执行期间的新消息进入下一批。
-- 单轮总时限为 120 秒，不限制工具调用次数。
+- 重复事件不重复入库、调用模型或发送；若上次调度失败，重送会修复实际调度后确认。
+- 同一 Agent 的轮次按 FIFO 处理，执行期间的新消息进入后续不可变批次。
+- 每次尝试的绝对期限为 120 秒，`MODEL_MAX_ROUNDS` 默认 6。恢复原 generation 不增加逻辑轮数，也不延长期限。
 - 首次发送前失败时，最多在 5、30、120 秒后重试三次。
 - QQ 明确拒绝发送时可以重试；结果不确定时不自动重发。
 - 一旦已成功发送，后续失败不得重放该消息。
+- Memory 写操作与持久收据在同一事务提交；恢复重放返回原结果，不重复变更。
+- 重启时未确认的 planned 发送收敛为 outcome_unknown；sent、unknown、silent 屏障均按业务 turn 保留。
+- 业务 turn 终态且 Pi 无在途引用后清除执行正文；事件去重墓碑、Memory、发送屏障和默认审计保留。
 - `CONTEXT_MESSAGE_LIMIT` 默认 30，采用滑动窗口自动注入最新可见消息；`MESSAGE_RETENTION_LIMIT` 默认 5000。超出上下文窗口的历史消息仍保留在 SQLite，Agent 可通过 `conversation_search` 按关键词、时间范围和条数主动检索；Memory 不受聊天清理影响。
 
 ## 非目标
@@ -133,17 +136,20 @@ apps/worker/src/prompts/system-prompt.md
 
 1. 群聊和私聊 Webhook 均能形成正确、隔离的 Agent 会话。
 2. 无效签名被拒绝，重复事件不会造成重复处理或回复。
-3. 空闲会话的两秒首批窗口、运行期间消息合并和轮次串行行为通过测试。
-4. 模型可连续调用 Memory、搜索、网页读取和消息发送工具后主动结束轮次。
+3. 固定两秒窗口、运行期间不可变批次和 FIFO 串行行为通过 Workers 验证。
+4. 模型能执行 Memory、搜索、网页读取，并通过独立 send/silent 调用正常终止。
 5. 图片开关能准确控制模型请求中的 `image_url`。
 6. Memory 的群级和成员级范围不能互相泄漏。
 7. 网页读取的 URL、重定向、超时、大小和类型限制通过测试。
 8. 已成功或结果未知的 QQ 发送不会被自动重复。
 9. TypeScript 检查、完整测试和 Wrangler 生产构建均成功。
 10. 群聊和 C2C 的端到端流程均验证 durable `send_message` 顺序、可见历史、失败重试和未知结果不重发。
+11. 模型/工具检查点中断后恢复同一 submission；Memory 与发送副作用不重复，期限不重置，后续批次无需新回调即可推进。
+12. 全新库初始化与终态执行正文清理保持约束、事件墓碑、发送屏障和 Pi ID 单调性。
 
 ## 相关文档
 
-- 详细设计：`docs/superpowers/specs/2026-09-15-qq-companion-runtime-design.md`
-- 实施计划：`docs/superpowers/plans/2026-09-15-qq-companion-runtime.md`
+- 当前数据设计：`docs/superpowers/specs/2026-10-03-pi-durable-database-design.md`
+- 当前迁移与验收计划：`docs/superpowers/plans/2026-10-03-pi-durable-runtime-migration.md`
+- 历史产品设计与实施基线：`docs/superpowers/specs/2026-09-15-qq-companion-runtime-design.md`、`docs/superpowers/plans/2026-09-15-qq-companion-runtime.md`
 - 当前差距：`docs/project-analysis.md`

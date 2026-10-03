@@ -1,266 +1,99 @@
-# MVP 验收报告
+# Pi Durable 运行时验收报告
 
-对应冻结设计 `docs/superpowers/specs/2026-09-15-qq-companion-runtime-design.md` 第 19 节。
-验收提交：`932cba1 feat: complete the QQ companion runtime`（Task 1–10 全部完成）。
+日期：2026-10-03。分支：`feat/pi-durable-runtime`。本报告替代自研工具循环的旧 MVP 验收结论，记录全新数据库接入、恢复与本地验证；生产切换另行规划。
 
-本报告只记录已执行的验证与证据，不包含真实 QQ、LLM、Exa 调用、真实凭据或生产部署。
+## 实现与固定版本
 
-## 验收环境
+- `@earendil-works/pi-durable`、`pi-ai`、`chord`：`0.99.2`；Cloudflare Agents：`0.23.0`。研究参考的 1.0.0 源码不等同于安装版本。
+- Wrangler：`4.131.2`；Node：`24.14.0`；Vitest：`4.1.11`。Worker compatibility date 保持 `2026-08-22`。
+- 实际 Pi SQLite API 为同步接口。`DurableSqliteDatabase` 使用 DO `transactionSync`、同步消费 cursor、拒绝 Promise transaction callback；关闭 SDK handle 不关闭或删除平台数据库。
+- Pi 拥有 generation/tool/submission 检查点；`qq_turns` 拥有业务 FIFO、重试与最终结果；`qq_attempts` 保存不可变输入、绝对期限、预算和平台回复绑定。
+- 每次 attempt 使用独立 conversation，同一 Pi commit 创建 `app.qq-attempt-link`，通过稳定 request ID 恢复 submission。旧 runToolLoop、旧 runner 与无用结果兼容字段已删除。
 
-| 项目 | 值 |
+依赖批次：`2eb15aa`；运行时与消费者合同批次：`3efea3d`。本报告与设计、架构、产品说明在文档批次一并归档。
+
+## 门禁
+
+| 命令 | 结果 |
 | --- | --- |
-| 提交 | `932cba1` |
-| 工作区 | 干净（`git status --short` 无输出） |
-| `git diff --check` | 通过，无输出 |
-| Node / 包管理 | pnpm workspace，依赖锁定于 `pnpm-lock.yaml` |
+| `pnpm typecheck` | 全部 5 个包通过 |
+| `pnpm test` | 186 项通过：Worker 106、model-provider 18、qqbot 22、web-tools 40；contracts 无测试文件，正常退出 |
+| `pnpm --filter @mikan-utsushi/worker exec wrangler deploy --dry-run` | 通过；3784.76 KiB，gzip 695.87 KiB；未部署 |
+| `git diff --check` | 通过，exit 0，无空白错误；仅 Windows LF/CRLF 转换提示 |
 
-## 逐条验收
+Worker 测试固定 `maxWorkers: 1`。首次默认并发运行时，74 项 Worker 测试通过，但另有 7 个测试进程在启动阶段发生 `ECONNRESET`，整次门禁失败；限制并发后全部测试文件通过，没有删除测试或缩小执行范围。
 
-### 1. Webhook 在持久化后才确认
+第三方依赖 `@modelcontextprotocol/sdk` 和 `cron-schedule` 仍输出缺失 sourcemap source 警告。Webhook 调度故障注入会产生预期的 `scheduler unavailable` RPC 日志；测试验证该请求返回 503、保留已入库事件、重送修复调度，不将它算作成功 ACK。
 
-**证据**
+## 消费者合同与故障证据
 
-- `apps/worker/test/webhook.integration.test.ts`
-  - `persists a supported message once and ACKs duplicate events`
-  - `returns 503 when Agent persistence fails`
-  - `rolls back a newly inserted event when scheduling fails so a retry can schedule it`
-- 实现：`apps/worker/src/index.ts` 先完成 `receiveMessage` RPC 再返回 200；持久化失败返回 503。
+| 合同 | 验证位置与观察 |
+| --- | --- |
+| Webhook ACK、签名、身份、重复事件 | `webhook.integration.test.ts`：鉴权与事件校验、真实新库接收、group/C2C 隔离、失败调度不 ACK、重送修复、管理员执行已到期业务重试 |
+| 固定窗口、不可变批次、FIFO、业务重试 | `agent-batching.integration.test.ts`、`pi-queue.integration.test.ts`：运行期间形成下一批，持久 5/30/120 秒重试，批次成员不变，最终推进队列 |
+| 独立 send/silent 与普通文本继续 | `pi-runtime.integration.test.ts`：文本继续、混合终止整轮无副作用、持久 max-rounds 和绝对期限；普通文本不能产生 QQ 输出 |
+| 模型协议与 SDK 运行 | `pi-feasibility.integration.test.ts`、model-provider 测试：真实 Harness/DO SQLite，完整 URL/query 不改写，非流式最终事件，tool-call 与 usage 账本，取消、HTTP/响应错误脱敏 |
+| 输入与 Memory 范围 | context 与 conversation 测试：当前批次图片开关、历史只用可见文本、成员来自不可变批次；后续输入无旧工具正文 |
+| Memory 副作用恢复 | `pi-effects.integration.test.ts`、`tool-runtime.memory.test.ts`：变更与收据同事务，失败回滚，重放返回原结果，即使 Memory 后来改变也不重复写入；不同参数或成员拒绝 |
+| QQ 发送屏障 | delivery/effects 测试：网络前计划、平台决定 reply/quote，sent/unknown/silent/planned 屏障按 turn 保留，新 call/task ID 不增加发送额度；明确拒绝可重试，未知结果不重发 |
+| 中断恢复 | `pi-runtime.integration.test.ts`：HTTP 中断后恢复同一 generation/submission，逻辑轮数与 deadline 不重置；已结束终止决定直接收敛 |
+| 空库事务、约束、查询规模 | `qq-schema.integration.test.ts`、`rows-read.integration.test.ts`：外键、唯一 active turn、不可删除终止屏障、事务回滚、handle 关闭重开；2,000 与 20,000 个 settled turn 后队列查询读行成本保持不超过 1 |
+| 终态清理与审计 | 完整 conversation 测试：关闭 Harness 后物理清理、全局 ID 单调、墓碑/Memory/屏障/脱敏审计保留；调试测试验证默认不写原始正文，显式开启才记录模型请求/响应与结构化错误 |
 
-**结论**：通过。ACK 不会早于 durable insertion。
+未知工具原来由 SDK 直接生成 `tool_unavailable` 结果，未进入项目执行审计。新增测试先观察到预期失败：审计只有 send_message，缺少 unknown/failed。修复在 generation hook 补记未知调用，并在 afterTool 补记 SDK 校验/策略拒绝；随后完整门禁通过，未知名称和原参数没有进入默认审计。
 
-### 2. 拒绝无效签名，安全确认不支持事件
+首次完整流程还暴露了生命周期启动/调度重入死锁。接收、flush、processor 入口现在先等待 SDK lifecycle 初始化，调度回调先取消自身记录再协调下一次唤醒；完整队列和独立进程重启均已验证。
 
-**证据**
+## 独立 workerd smoke
 
-- `apps/worker/test/webhook.integration.test.ts`
-  - `returns 401 for missing or invalid signatures`
-  - `ACKs valid unsupported events without calling the Agent`
-  - `returns 400 for empty, malformed, or structurally invalid payloads`
-- `packages/qqbot/src/signature.test.ts`
-  - `accepts a valid signature over the exact raw body bytes`
-  - `rejects a signature when any raw body byte changes`
-  - `produces a stable validation signature for fixed input`
+使用临时 `.pi-smoke/main.ts` 与独立 `SmokeAgent` namespace，继承生产 `GroupChatAgent`，调用真实 Pi Harness、DO SQLite、项目模型/QQ client 与 Memory runtime。只替换 HTTP 返回为受控合成响应；没有 Vitest、MemoryStorage 或真实外部请求。
 
-**结论**：通过。验签基于原始 body 字节，任何字节改动都会失败。
-
-### 3. 重复 event ID 不会产生重复 turn 或发送
-
-**证据**
-
-- `apps/worker/test/webhook.integration.test.ts`
-  - `persists a supported message once and ACKs duplicate events`
-  - `runs a webhook-created C2C message through batching and one durable delivery` 中重复 webhook 后 `outbound_deliveries` 仍只有一条记录
-- Schema 约束：`messages.event_id UNIQUE`、`outbound_deliveries UNIQUE (turn_id, tool_call_id)`（`apps/worker/src/agents/schema.ts`）。
-
-**结论**：通过。
-
-### 4. 固定两秒窗口形成单个不可变 turn
-
-**证据**
-
-- `apps/worker/test/agent-batching.integration.test.ts`
-  - `claims all messages in the two-second window in insertion order`
-  - `preserves turn message membership through retries`
-- 实现常量：`DEBOUNCE_SECONDS = 2`（`apps/worker/src/agents/group-chat-agent.ts`）。
-
-**结论**：通过。
-
-### 5. Turn 执行期间到达的消息进入后续 turn
-
-**证据**
-
-- `apps/worker/test/agent-batching.integration.test.ts`
-  - `keeps the first turn running while a message received during it forms a second turn`
-  - `keeps later messages in a second immutable turn`
-
-**结论**：通过。
-
-### 6. Agent 内 FIFO，且与其他 Agent 隔离
-
-**证据**
-
-- `apps/worker/test/agent-batching.integration.test.ts`
-  - `does not run two turns concurrently and preserves FIFO order`
-  - `rejects a first message whose payload does not match the fixed Agent identity`
-  - `rejects a message from a different conversation identity in the same Agent`
-  - `accepts a first message matching a fixed C2C Agent identity`
-- `apps/worker/test/webhook.integration.test.ts`
-  - `uses isolated group and C2C Agent names`
-- 实现：`apps/worker/src/agents/group-chat-agent.ts` 从 `this.ctx.id.name` 派生并校验 `qq:group:*` / `qq:c2c:*`，不信任消息行。
-
-**结论**：通过。跨群或跨 C2C 身份无法合并或串扰。
-
-### 7. 可配置的 OpenAI-compatible 端点完成多步工具循环
-
-**证据**
-
-- `apps/worker/test/conversation.integration.test.ts`：单轮内执行 5 次工具调用后继续到第二次 completion。
-- `apps/worker/test/turn-runner.integration.test.ts`：工具循环 + 上下文装配。
-- `packages/model-provider/src/openai-compatible.test.ts`：13 项，含完整 URL、Bearer、tool_calls 映射、SDK 路径与 direct fetch 回退选择。
-
-**结论**：通过。工具循环以模型不再返回 tool calls 结束，不设调用次数上限。
-
-### 8. 只有 `send_message` 产生 QQ 输出，支持多次调用
-
-**证据**
-
-- `apps/worker/test/conversation.integration.test.ts`：两次 `send_message` 按顺序投递，`sendTargets` 精确等于这两次显式发送；后续普通 assistant 文本 `done` 不产生任何发送。
-- `apps/worker/test/tool-runtime.web.test.ts`：`exposes memory, web, and send tools`。
-- 实现：`runToolLoop` 只累加工具结果里的 `sentCount`，assistant 文本无副作用。
-
-**结论**：通过。
-
-### 9. 启用 vision 的 turn 携带图片 URL，禁用时不携带
-
-**证据**
-
-- `apps/worker/test/conversation.integration.test.ts`
-  - group 用例 `visionEnabled: true` 断言模型输入含 `image_url`
-  - c2c 用例 `visionEnabled: false` 断言序列化后不含 `image_url`
-
-**结论**：通过。
-
-### 10. Memory 保持群与当前群成员隔离
-
-**证据**
-
-- `apps/worker/test/tool-runtime.memory.test.ts`
-  - `exposes only group and current-user memory scopes`
-  - `isolates group and member memories`
-  - `escapes LIKE metacharacters and returns empty queries by recency`
-  - `enforces ownership for update and delete`
-  - `does not create memories without an explicit memory tool call`
-
-**结论**：通过。scope 由当前 Agent 与 `speakerId` 派生，模型无法指定任意 user ID。
-
-### 11. Exa 搜索与受限网页读取通过 mock 契约测试
-
-**证据**
-
-- `packages/web-tools/src/exa-search.test.ts`（9 项）：精确 direct REST 请求、AbortSignal、空 query、最多 5 条、非 2xx 不复制响应体、malformed JSON 与形状校验。
-- `packages/web-tools/src/url-policy.test.ts`、`limited-fetch.test.ts`、`html-to-text.test.ts`：SSRF 校验、最多 3 次重定向且逐跳重新校验、MIME 白名单、剥离环境凭据、大小上限、共享超时、`HTMLRewriter` 提取与 30,000 字符截断。
-- `apps/worker/test/conversation.integration.test.ts`：`search_web` 与 `read_web` 结果回传给模型，且网页正文不进入审计表。
-- `packages/web-tools/src/index.test.ts`：网页内容标记为 `untrusted_web_content`。
-
-**结论**：通过。全部为 mock，无真实 Exa 或外部网页调用。
-
-### 12. 重试不会重复已知成功或未知结果的发送
-
-**证据**
-
-- `apps/worker/test/tool-runtime.delivery.integration.test.ts`
-  - `plans before sending, records visible output, and does not resend sent calls`
-  - `repairs a sent delivery after a crash window without sending again`
-  - `treats a recovered planned delivery as an unknown barrier without resending`
-  - `finalizes an unknown outcome and turn flag in one transaction callback`
-  - `records unknown outcomes and never resends them`
-  - `allows an explicit failure to retry the same delivery`
-- `apps/worker/test/agent-batching.integration.test.ts`
-  - `uses the fixed retry schedule`（5 / 30 / 120 秒）
-  - `marks a turn failed without retrying after the third retry or after send`
-  - `uses persisted has_sent when execution fails after send_message`
-
-**结论**：通过。sent 与 outcome_unknown 均为持久屏障，planned 恢复升级为 unknown 屏障。
-
-### 13. 历史上下文只含可见消息，retention 生效
-
-**证据**
-
-- `apps/worker/test/agent-batching.integration.test.ts`：`retains only the newest visible chat rows after completion`
-- `apps/worker/test/turn-runner.integration.test.ts`：`passes an immutable batch, visible history, and the real QQ speaker ID into the runner`
-- 实现：`apps/worker/src/agents/context.ts` 只选取 `status === 'visible'`；`group-chat-agent.ts` 的清理只删除超出 `MESSAGE_RETENTION_LIMIT` 的最旧 visible 行，不删除 memories、turns、tool_calls 或 outbound_deliveries。
-
-**结论**：通过。
-
-### 14. Typecheck、单元测试、Worker 集成测试、生产构建全部成功
-
-**命令与结果**
+监督服务使用本机 Node 的绝对路径启动：
 
 ```text
-pnpm typecheck                                        → 通过（5/6 workspace 项目，contracts 无测试文件正常跳过）
-pnpm test                                             → 通过
-  apps/worker        10 files   74 tests
-  packages/qqbot      3 files   20 tests
-  packages/web-tools  5 files   40 tests
-  packages/model-provider 1 file 14 tests
-  packages/contracts 无测试文件，按配置退出 0
-pnpm --filter @mikan-utsushi/worker exec wrangler deploy --dry-run
-                                                      → 通过
-                                                        bindings: GROUP_CHAT_AGENT, QQ_API_BASE, QQ_TOKEN_URL
-                                                        --dry-run: exiting now（未部署）
-git diff --check                                      → 通过，无输出
+"C:/Users/mikan/scoop/apps/nvm/current/nodejs/nodejs/node.exe" node_modules/wrangler/bin/wrangler.js dev --config .pi-smoke/wrangler.jsonc --local --port 8793
 ```
 
-**结论**：通过。
+读取 `/run?kind=group`、`/run?kind=c2c`、`/recovery` 的实际 JSON；之后通过 `/restart-start` 挂起第一批模型请求，停止整个服务，使用同一命令和本地 SQLite 重启，再读取 `/restart-inspect`。恢复阶段没有追加 webhook 或手动触发 runTurn。
 
-## 本地 workerd 冒烟验证
+| 观察 | group | C2C |
+| --- | --- | --- |
+| 业务 turn 1 | completed / sent | completed / sent |
+| 业务 turn 2 | completed / silent | completed / silent |
+| 业务 turn 3，第四次尝试已过期 | failed / deadline / attempt_count=4 | failed / deadline / attempt_count=4 |
+| 后续 turn 4 | completed / silent | completed / silent |
+| 受控模型 / token / send 请求 | 6 / 1 / 1 | 6 / 1 / 1 |
+| 重复回调 | accepted / duplicate=true，未重发 | accepted / duplicate=true，未重发 |
+| 事件墓碑 | 3 | 3 |
+| Pi entries / tasks / 非空输入快照 | 0 / 0 / 0 | 0 / 0 / 0 |
+| 最终持久调度 | 空 | 空 |
 
-在真实 `wrangler dev`（workerd）中，用本地 mock 替代 QQ/LLM/Exa 端点（无真实凭据、无真实网络出口），通过 HTTP 驱动全部入口：
+每个正常业务 turn 实际执行 Memory 写入，然后独立发送或静默终止。三条 Memory 写入和送达屏障在私有执行正文清理后仍保留；过期尝试没有获得新的期限或触发模型请求，后续批次继续执行。
 
-| 检查项 | 结果 |
-| --- | --- |
-| `GET /health` | 200 `{"ok":true,...}` |
-| QQ 验证回调（op 13） | 200，返回 ed25519 signature |
-| 无效签名 | 401 `{"error":"invalid signature"}` |
-| 签名群消息 | 200 `{"op":12,"d":0}` |
-| 重复 event | 200，DB 中仍只有 1 条 inbound |
-| 签名 C2C 消息 | 200，独立 Agent |
-| 2 秒窗口批量 | 两条群消息合并为同一 turn（`turn_messages` 两条） |
-| LLM 工具循环 | 多次 completion，含 assistant/tool 往返回填 |
-| QQ token 请求 | `POST /token`，携带 `appId`/`clientSecret` |
-| 群聊发送 | `POST /v2/groups/{id}/messages`，`{"content":…,"msg_type":0}`，`Authorization: QQBot …` |
-| C2C 发送 | `POST /v2/users/{id}/messages` |
-| delivery 持久化 | `sent`，`turns.has_sent=1`，visible outbound message 写入 |
-| tool_calls 审计 | `send_message` / `completed`，arguments 为有界脱敏摘要 |
-| 普通文本不发送 | 模型返回纯文本的 turn 产生 0 次 QQ 请求 |
-| Agent 隔离 | group 与 C2C 落在不同 Durable Object SQLite 文件 |
+Harness 关闭/重开场景：中断请求后物理请求计数为 2，但逻辑 generation 为 1、submission 为 1，deadline 未变，最终 silent。
 
-冒烟过程中发现并修复了一个 dry-run 与单元测试均无法发现的生产阻塞缺陷，见下节。
+整个进程中断/重启场景的持久观察：
 
-## 冒烟发现并修复的生产缺陷
+| 字段 | 中断前 | 恢复后 |
+| --- | --- | --- |
+| turn 1 | active / attempt 1 | completed / sent / attempt 1 |
+| turn 2 | queued / attempt 0 | completed / silent / attempt 1 |
+| 第一轮 generation ID | 10 | 10 |
+| turn 1 deadline_at | 1790989596810 | 1790989596810 |
+| 受控模型请求总计 | 1 | 5，含中断请求和两批工具链 |
+| QQ send 总计 | 0 | 1 |
+| Memory 行数 | 0 | 2 |
+| Pi submission / 持久调度 | 1 / 已安排 wakeProcessor | 0 / 空 |
 
-**现象**：在 workerd 中，QQ token 请求抛 `TypeError: Illegal invocation: function called with incorrect \`this\` reference`。
+这证明原任务与下一批在真实 workerd 重启后恢复并收敛；SDK 的检查点不会消除物理模型请求重发，也不保证外部 QQ 恰好发送一次。未知发送结果采用保守屏障，可能静默丢失一条回复，以避免重复发送。
 
-**根因**：把全局 `fetch` 取出存为字段后以方法形式调用，未绑定 `this`：
+Smoke 入口、配置、独立 SQLite、临时服务均已删除或停止；未进入提交。
 
-```ts
-this.fetchFn = options.fetchFn ?? fetch;  // 取值时未绑定
-await this.fetchFn(...)                   // workerd 拒绝以非全局接收者调用
-```
+## 部署与验证限制
 
-**影响**：`packages/qqbot/src/client.ts`（QQ 收发全部失败）、`packages/model-provider/src/openai-compatible.ts`（direct-fetch 分支）、`packages/web-tools/src/exa-search.ts`、`packages/web-tools/src/limited-fetch.ts`。
+- 当前初始化只支持全新数据库，遇到旧 schema 会拒绝。本次没有旧数据兼容、导入、清空或生产 namespace/binding 切换。
+- 没有生产部署、登录、Wrangler Secret 写入或真实 QQ/LLM/Exa 调用。真实凭据、频控、回调注册和平台服务行为不由合成 smoke 证明。
+- Pi SDK 为 Experimental，固定版本的同步存储和清理实现不能直接套用后续版本；升级必须重新验证。
+- 显式 `TURN_DEBUG_ENABLED=true` 会保留原始敏感正文；它与默认审计分开，不参与可见聊天 retention，需要按部署排障流程手动关闭/清理。
 
-**为何此前未发现**：所有相关测试都注入了 `fetchFn`，默认全局 `fetch` 路径从未在 Workers 池中执行；Wrangler dry-run 只证明可打包，不证明运行时行为。
-
-**修复**：四处均改为 `options.fetchFn ?? globalThis.fetch.bind(globalThis)`，并为每个位置补充 Workers 池回归测试（修复前真实 FAIL 并复现 `Illegal invocation`）。
-
-**验证**：修复后同一冒烟流程完成 token 获取与群聊、C2C 真实发送。
-
-## 本地配置说明
-
-`pnpm dev` 在 `apps/worker/` 下运行 `wrangler dev`，因此本地凭据必须位于 `apps/worker/.dev.vars`。放在仓库根目录的 `.dev.vars` 不会被加载，所有 Secret 会变为 undefined（表现为 QQ 验证回调 500）。README 已更正。
-
-## 凭据与测试夹具
-
-- 仓库未跟踪 `.dev.vars`；仅跟踪 `.dev.vars.example`（占位值）。
-- 对 `apps/`、`packages/` 的测试夹具扫描未发现形如真实密钥的字面量（`sk-*`、`AKIA*`、`exa-*`）。
-- 测试中的凭据均为明显占位值（如 `app-id`、`llm-key`、`exa-key`）。
-
-## 已知非阻塞项
-
-1. Worker 测试输出包含第三方依赖（`@modelcontextprotocol/sdk`、`cron-schedule`）缺失 sourcemap source 的警告，不影响结果。
-2. `read_web` 未注入自定义 DNS resolver；域名、字面 IP 与每次重定向仍会校验，冻结设计允许在平台无可靠解析能力时省略。
-3. turn deadline 的 caller abort reason 为普通 `Error`，QQ client 会把已派发请求归类为 `unknown/transport` 而非 `unknown/timeout`；安全屏障成立，仅诊断分类不够精确。
-4. planned recovery 在数据库保持 `planned` 状态、仅逻辑返回 unknown，可观测性较弱。
-
-以上均不构成验收阻塞项。
-
-## 尚未执行
-
-- 依赖安装与 `wrangler` 登录未在验收流程中自动执行。
-- 未执行生产部署、未配置 Wrangler Secrets、未在 QQ 开放平台注册回调 URL。
-- 未进行真实 QQ、LLM、Exa 调用。
-
-本地冒烟使用 mock 端点，可验证 Worker 路由、Durable Object、批处理、工具循环、QQ 请求形状与持久化状态，但不能证明真实 QQ 平台的凭据、频控与回调注册配置。
-
-生产上线步骤需要用户提供凭据并明确授权。
+当前数据合同见 [数据库设计](superpowers/specs/2026-10-03-pi-durable-database-design.md)，完整实施状态见 [迁移计划](superpowers/plans/2026-10-03-pi-durable-runtime-migration.md)。

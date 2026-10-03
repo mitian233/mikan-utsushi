@@ -1,16 +1,18 @@
 # mikan-utsushi
 
-Cloudflare Workers + Agents QQ 群聊/C2C 聊天伙伴运行时。
+Cloudflare Workers + Agents + Pi Durable QQ 群聊/C2C 聊天伙伴运行时。当前实现只支持全新会话数据库；旧数据库的上线切换与处置需另行规划。
 
 ## 已实现能力
 
 - 验证 QQ Webhook，并在持久化后确认回调；支持群聊与 C2C 私聊。
 - 使用固定两秒批处理、Agent 内 FIFO 轮次和 5/30/120 秒失败重试。
 - 每个 `qq:group:{group_openid}` 或 `qq:c2c:{user_openid}` Agent 使用独立 SQLite 状态。
-- 通过 OpenAI-compatible Chat Completions 运行工具循环；普通 assistant 文本不会自动发送。
-- `send_message` 是唯一 QQ 输出工具，支持 durable delivery、明确失败和未知结果屏障。
+- Pi Harness 持久保存模型 generation、工具 task 和 submission；通过项目 adapter 调用 OpenAI-compatible Chat Completions。
+- 只有独立的 `send_message(action=send|silent)` 正常终止尝试；普通 assistant 文本继续执行，混合终止响应整轮拒绝。
 - 支持 vision 图片输入、隔离 Memory、Exa `search_web` 和受限 direct-fetch `read_web`。
-- 仅保留配置数量的可见聊天记录；每次工具调用写入 Agent 私有 SQLite 的 `tool_calls` 审计表，Memory、turn、tool-call 和 delivery 审计记录不受聊天清理影响。
+- 可见聊天按配置数量清理；`qq_events` 去重墓碑、Memory、业务结果、发送屏障和 `qq_tool_audit` 脱敏审计保留。业务终态后清除私有 Pi 执行正文与输入快照。
+
+Pi 依赖固定为 `@earendil-works/pi-durable`、`pi-ai`、`chord` 的 `0.99.2`，SDK 仍为 Experimental。每次尝试持久保存 120 秒绝对期限与 `MODEL_MAX_ROUNDS`（默认 6）；重启恢复原任务，不重置期限或逻辑轮数。
 
 ## 项目结构
 
@@ -58,6 +60,8 @@ EXA_API_KEY
 冻结需求、设计和实施任务分别位于：
 
 - `docs/PRD.md`
+- `docs/superpowers/specs/2026-10-03-pi-durable-database-design.md`
+- `docs/superpowers/plans/2026-10-03-pi-durable-runtime-migration.md`
 - `docs/superpowers/specs/2026-09-15-qq-companion-runtime-design.md`
 - `docs/superpowers/plans/2026-09-15-qq-companion-runtime.md`
 - `docs/architecture.md`

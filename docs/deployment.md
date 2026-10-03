@@ -2,6 +2,8 @@
 
 本清单说明如何把 `mikan-utsushi` 部署到一个 Cloudflare 账号并连接一个 QQ 机器人。
 
+当前 Pi Durable 实现只支持全新会话数据库。旧数据库会被初始化拒绝；本清单不能作为覆盖旧部署的切换方案。namespace/binding 切换、旧数据处置与代码回滚的数据兼容需在本地验收后另行规划，见 [运行时迁移计划](superpowers/plans/2026-10-03-pi-durable-runtime-migration.md)。
+
 执行前请确认：**部署会使用真实凭据并对外提供回调端点**。请先完成本地冒烟测试，并确认你已获得部署授权。
 
 ## 0. 前置条件
@@ -117,15 +119,15 @@ pnpm exec wrangler deploy
 
 ```sql
 -- 按时间顺序看某个 Agent 的全部调试记录
-SELECT id, turn_id, attempt_count, round, event, payload, created_at
-FROM turn_debug ORDER BY id DESC LIMIT 50;
+SELECT id, turn_id, attempt, round, event, payload_json, created_at
+FROM qq_turn_debug ORDER BY id DESC LIMIT 50;
 
 -- 只看模型每轮返回的原文
-SELECT round, payload FROM turn_debug
+SELECT round, payload_json FROM qq_turn_debug
 WHERE event = 'model_response' ORDER BY id DESC LIMIT 20;
 
 -- 只看失败原因
-SELECT payload, created_at FROM turn_debug
+SELECT payload_json, created_at FROM qq_turn_debug
 WHERE event = 'turn_error' ORDER BY id DESC LIMIT 20;
 ```
 
@@ -137,7 +139,7 @@ WHERE event = 'turn_error' ORDER BY id DESC LIMIT 20;
 | `model_response` | 模型该轮的原始返回，含 `content` 与 `toolCalls` |
 | `turn_error` | turn 失败原因 |
 
-字段：`turn_id`、`attempt_count`（第几次尝试）、`round`（该次尝试内的第几轮模型调用）、`event`、`payload`（JSON）、`created_at`。
+字段：`turn_id`、`attempt`（第几次业务尝试）、`round`（逻辑 generation 轮数）、`event`、`payload_json`（JSON）、`created_at`。`turn_error` 保存结构化错误分类。
 
 手动触发卡住的 turn（仅临时排障使用）：
 
@@ -155,13 +157,13 @@ curl -X POST https://<你的 worker 域名>/admin/retry-turn \\
 
 接口只接受 `POST`，成功表示已调用对应 Agent 的 `retryTurn`。恢复后应删除该 Secret 并重新部署；不要长期暴露此管理接口。
 
-**安全警示**：开启后 `turn_debug` 会持久化**未脱敏**的完整模型请求与回复，其中可能包含私聊正文、网页正文和 Memory 内容。此表与已脱敏的 `tool_calls` 审计表相互独立。仅在排查期间开启，完成后关闭并清理：
+**安全警示**：开启后 `qq_turn_debug` 会持久化**未脱敏**的完整模型请求与回复，其中可能包含私聊正文、网页正文和 Memory 内容。此表与已脱敏的 `qq_tool_audit` 相互独立。仅在排查期间开启，完成后关闭并清理：
 
 ```sql
-DELETE FROM turn_debug;
+DELETE FROM qq_turn_debug;
 ```
 
-关闭方式：`pnpm exec wrangler secret put TURN_DEBUG_ENABLED` 输入 `false`，然后重新部署。`turn_debug` 不参与 `MESSAGE_RETENTION_LIMIT` 自动清理，需手动删除。
+关闭方式：`pnpm exec wrangler secret put TURN_DEBUG_ENABLED` 输入 `false`，然后按已批准的部署方案发布。`qq_turn_debug` 不参与 `MESSAGE_RETENTION_LIMIT` 自动清理，需手动删除。
 
 ## 8. 行为调整
 

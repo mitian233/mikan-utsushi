@@ -1,6 +1,6 @@
 # QQ Companion Runtime Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> Historical implementation baseline. Runtime execution and fresh-database initialization are superseded by the [Pi Durable migration plan](2026-10-03-pi-durable-runtime-migration.md) and [data design](../specs/2026-10-03-pi-durable-database-design.md). Remaining examples below describe the original implementation; they are not instructions for restoring the deleted loop or old schema.
 
 **Goal:** Build a runnable Cloudflare-hosted QQ group and C2C companion with durable batching, an OpenAI-compatible tool loop, vision, explicit memory, Exa search, restricted webpage reading, and plain-text QQ replies.
 
@@ -19,7 +19,7 @@
 - Treat `LLM_CHAT_COMPLETIONS_URL` as a complete URL and send the API key as a Bearer token.
 - Keep a compatibility date on or after `2026-08-04`, which enables Workers Node.js compatibility by default. Do not treat this as a complete Node.js runtime: every imported SDK path must pass the Workers test pool, and the integrated application must pass the production bundle check before final acceptance.
 - Keep the fixed batch window at two seconds and the full turn deadline at 120 seconds.
-- Do not impose a tool-call-count limit; a turn ends when the model returns no tool calls.
+- Persist a 120-second absolute attempt deadline and `MODEL_MAX_ROUNDS` (default 6); ordinary text continues, and only a standalone `send_message(send|silent)` normally ends an attempt. Recovery preserves generation identity and budget.
 - Only `send_message` may emit QQ output; plain assistant content has no external effect.
 - Keep Memory private to one Agent and never link group and C2C identities.
 - Use Exa only for `search_web` and keep its client on direct Worker `fetch` until the Exa SDK provides verified abort and timeout propagation. Implement `read_web` permanently with restricted direct Worker `fetch`.
@@ -557,84 +557,11 @@ git commit -m "feat: batch and serialize conversation turns
 Co-Authored-By: openai-code-agent[bot] <242516109+Codex@users.noreply.github.com>"
 ```
 
-### Task 6: Vision-aware model context and unlimited tool loop
+### Task 6: Vision-aware context and durable model execution
 
-**Files:**
-- Create: `apps/worker/src/agents/context.ts`
-- Create: `apps/worker/src/agents/turn-runner.ts`
-- Create: `apps/worker/src/agents/turn-runner.test.ts`
-- Modify: `apps/worker/src/agents/group-chat-agent.ts`
-- Modify: `apps/worker/package.json`
+Superseded by batches 2–3 of the [Pi Durable migration plan](2026-10-03-pi-durable-runtime-migration.md). `context.ts` still assembles visible history and current images. `runtime-types.ts` defines project execution contracts; `pi-runtime.ts` hosts real durable generation/tool tasks, and `packages/model-provider/src/pi-models.ts` bridges the existing Chat Completions client.
 
-**Interfaces:**
-- Consumes: immutable turn messages, recent visible messages, `SYSTEM_PROMPT`, `RuntimeConfig`, `OpenAICompatibleClient`, and `ToolRuntime.execute`.
-- Produces: `buildInitialModelMessages`, `runToolLoop`, a 120-second shared deadline, and a result distinguishing completed, retryable failure, and post-send failure.
-
-- [ ] **Step 1: Write failing context tests**
-
-Assert history includes only visible inbound/outbound messages, excludes tool/audit rows, and respects `CONTEXT_MESSAGE_LIMIT`. For current images:
-
-```ts
-expect(partsWhenEnabled).toContainEqual({
-  type: "image_url",
-  image_url: { url: "https://multimedia.nt.qq.com/image-1" },
-});
-expect(partsWhenDisabled.some((part) => part.type === "image_url")).toBe(false);
-```
-
-- [ ] **Step 2: Write failing tool-loop tests**
-
-Provide three fake completions: two with tool calls and one without. Assert calls execute in listed order, every result is appended with the matching `tool_call_id`, there is no iteration limit, and assistant text never invokes QQ delivery implicitly.
-
-Use an injected clock/abort controller and assert the same 120-second deadline covers all completions and tools.
-
-- [ ] **Step 3: Run the tests and verify failure**
-
-Run:
-
-```bash
-pnpm --filter @mikan-utsushi/worker test -- src/agents/turn-runner.test.ts
-```
-
-Expected: FAIL because context assembly and the tool loop do not exist.
-
-- [ ] **Step 4: Implement the exact runner boundary**
-
-Export:
-
-```ts
-export interface ToolRuntime {
-  execute(call: ModelToolCall, context: ToolExecutionContext): Promise<ToolExecutionResult>;
-}
-
-export async function runToolLoop(input: {
-  client: OpenAICompatibleClient;
-  messages: ModelMessage[];
-  tools: ModelToolDefinition[];
-  runtime: ToolRuntime;
-  context: ToolExecutionContext;
-  timeoutMs?: number;
-}): Promise<{ sentCount: number; usage: ModelUsage[] }>;
-```
-
-Default `timeoutMs` to `120_000`. Keep looping while tool calls are present. Return when a valid assistant response has none.
-
-Add `"@mikan-utsushi/model-provider": "workspace:*"` to the Worker dependencies and import `SYSTEM_PROMPT` from `src/prompts/index.ts`.
-
-- [ ] **Step 5: Connect `runTurn` without implementing concrete tools**
-
-Have `GroupChatAgent.runTurn` load the immutable batch and recent visible history, call the runner through a temporary runtime whose unknown tools return a structured error, and map runner outcomes to Task 5 retry state.
-
-- [ ] **Step 6: Run checks and commit after approval**
-
-```bash
-pnpm --filter @mikan-utsushi/worker test -- src/agents/turn-runner.test.ts test/agent-batching.integration.test.ts
-pnpm --filter @mikan-utsushi/worker typecheck
-git add apps/worker/package.json apps/worker/src/agents/context.ts apps/worker/src/agents/turn-runner.ts apps/worker/src/agents/turn-runner.test.ts apps/worker/src/agents/group-chat-agent.ts
-git commit -m "feat: run vision aware model tool loops
-
-Co-Authored-By: openai-code-agent[bot] <242516109+Codex@users.noreply.github.com>"
-```
+The old `runToolLoop`, runner module and temporary tool runtime have been removed. Current acceptance covers standalone send/silent, ordinary-text continuation, rejection of every effect in mixed terminal rounds, persisted logical round/deadline budgets, exact endpoint URLs, images, usage, cancellation and redacted errors in Workers. Tests and independent workerd smoke must exercise the new boundary.
 
 ### Task 7: Explicit scoped Memory tools
 

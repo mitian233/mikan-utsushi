@@ -13,18 +13,17 @@ Cloudflare Worker
   └─ route by stable conversation identity
        ▼
 GroupChatAgent (one Agent instance per group or C2C conversation)
-  ├─ SQLite message inbox
-  ├─ fixed two-second schedule
-  ├─ FIFO turn queue
-  ├─ visible chat history and scoped Memory
-  └─ OpenAI-compatible tool loop
-       ├─ memory_search/write/update/delete
-       ├─ Exa search_web
-       ├─ restricted direct read_web
-       └─ QQ send_message
-              ├─ planned delivery before network I/O
-              ├─ sent / failed / outcome_unknown state
-              └─ visible outbound history
+  ├─ qq_events tombstones + qq_messages inbox and immutable batches
+  ├─ fixed two-second schedule + FIFO qq_turns
+  ├─ qq_attempts: absolute deadline, budget and visible-input snapshot
+  └─ Pi Harness: generation / tool task / submission checkpoints
+       ├─ project Chat Completions provider adapter
+       ├─ memory_* + transactional qq_effect_receipts
+       ├─ Exa search_web + restricted direct read_web
+       └─ send_message(send|silent), the only normal terminal decision
+              ├─ qq_deliveries turn-level barrier before network I/O
+              ├─ sent / failed / outcome_unknown / silent
+              └─ unique visible outbound history
 ```
 
 ## Workers runtime and SDK policy
@@ -56,10 +55,20 @@ The callback body is always read as raw bytes before verification. Web content a
 
 ## Persistence boundary
 
-The first version uses the Agent's own SQLite storage for per-conversation runtime state. Agent names are `qq:group:{group_openid}` and `qq:c2c:{user_openid}`. D1, R2 and external queues are deliberately deferred until a measured requirement appears.
+Each stable Agent owns one fresh SQLite database. Names remain `qq:group:{group_openid}` and `qq:c2c:{user_openid}`. No old schema/data import or compatibility path is implemented; initialization rejects a legacy database. Production namespace/binding cutover and old-data disposition require a separate rollout plan. D1, R2 and external queues remain outside the architecture.
+
+Pi Durable, Pi AI and Chord are pinned to `0.99.2`; Agents is pinned to `0.23.0`. These SDK paths are exercised in workerd. The installed Pi version uses synchronous SQLite transactions: `DurableSqliteDatabase` consumes cursors synchronously and wraps each storage commit in `transactionSync`, rejects async transaction callbacks, and closes only its SDK handle. Research against the later 1.0.0 source does not define this adapter's API.
+
+Each business attempt has an isolated Pi conversation. Conversation creation and `app.qq-attempt-link` are committed together; recovery reacquires a submission through the stable `qq-turn:{turnId}:attempt:{attempt}` request ID. Pi owns execution position. The business tables own FIFO, retry times, immutable input and terminal outcome; fibers keep execution alive and alarms reconcile persisted work. Initialization arranges recovery without waiting for a whole model run.
+
+The default budget is six logical generation tasks and a persisted 120-second deadline. Restarting a generation preserves its identity and remaining time. Provider and Pi automatic retries and compaction are disabled. Business failures retry after 5/30/120 seconds. Ordinary model text continues through `onYield`; only a single send/silent call terminates normally, and mixed terminal rounds execute no effects.
+
+Memory writes and replay receipts commit together. QQ planned/sent/unknown/silent barriers are keyed by business turn, so a changed task or call ID cannot create a new send allowance. Recovery converts an abandoned plan to unknown; it never retries a successful or uncertain send.
 
 ## Configuration and retention
 
-The four required secrets are `QQ_APP_ID`, `QQ_APP_SECRET`, `LLM_API_KEY`, and `EXA_API_KEY`; production values are Wrangler Secrets and there is no dashboard or online prompt editor. The source-controlled persona is `apps/worker/src/prompts/system-prompt.md`. `CONTEXT_MESSAGE_LIMIT` and `MESSAGE_RETENTION_LIMIT` control visible context and cleanup. Cleanup deletes only the oldest visible chat rows; Memory, turns, tool-call audit records, and outbound delivery records remain durable. Each model tool call is persisted in `tool_calls` with its name, bounded/redacted argument metadata, status, and bounded/redacted result metadata; complete arguments and results are never stored or copied into later model context.
+The four required secrets are `QQ_APP_ID`, `QQ_APP_SECRET`, `LLM_API_KEY`, and `EXA_API_KEY`; production values are Wrangler Secrets. The source-controlled persona is `apps/worker/src/prompts/system-prompt.md`. `CONTEXT_MESSAGE_LIMIT` controls visible context; `MESSAGE_RETENTION_LIMIT` cleanup runs every tenth settled turn. Event tombstones, Memory, business metadata, delivery barriers and `qq_tool_audit` bounded/redacted summaries remain durable. Unknown, invalid and blocked tool calls also retain failed audit metadata without their raw names or bodies.
 
-The full frozen design is `docs/superpowers/specs/2026-09-15-qq-companion-runtime-design.md`.
+An active attempt requires its private snapshot, Pi transcript and replay results. After the business turn is terminal, the host aborts remaining work, retires its link and closes the Harness; the fixed-version adapter atomically removes that attempt's execution records and clears snapshots, receipt results and delivery body. It preserves global ID allocation and rejects live/referenced work. Explicit `TURN_DEBUG_ENABLED=true` records raw model requests/responses and structured turn errors in `qq_turn_debug`; these records remain separate and are never ordinary logs or subsequent context.
+
+The current data contract is [Pi Durable database design](superpowers/specs/2026-10-03-pi-durable-database-design.md); implementation and acceptance are tracked in [the migration plan](superpowers/plans/2026-10-03-pi-durable-runtime-migration.md).

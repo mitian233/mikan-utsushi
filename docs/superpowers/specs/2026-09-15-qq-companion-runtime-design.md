@@ -1,6 +1,6 @@
 # QQ Companion Runtime Design
 
-**Status:** Frozen on 2026-09-15
+**Status:** Historical product baseline frozen on 2026-09-15; execution and database ownership superseded by the [Pi Durable data design](2026-10-03-pi-durable-database-design.md) and [migration plan](../plans/2026-10-03-pi-durable-runtime-migration.md) on 2026-10-03. The table descriptions in section 11 document the old database and must not be used to initialize the current runtime.
 
 ## 1. Purpose
 
@@ -20,8 +20,8 @@ The MVP must:
 - merge messages arriving within a fixed two-second window;
 - execute only one model turn at a time for each Agent instance;
 - call an OpenAI-compatible Chat Completions endpoint chosen through environment variables;
-- support `tools` and `tool_calls` until the model ends the turn;
-- let the model send zero, one, or multiple plain-text QQ messages;
+- support `tools` and `tool_calls` through durable Pi tasks;
+- terminate with one explicit `send_message(action=send|silent)` decision per business turn;
 - understand QQ image URLs when vision is enabled;
 - keep explicit, per-conversation long-term memories;
 - search with Exa and read public webpages through a self-hosted read-only fetcher;
@@ -356,23 +356,24 @@ When vision is disabled, image metadata remains stored but no image part is sent
 
 Loop behavior:
 
-1. Start a 120-second turn deadline covering all model and tool calls.
-2. Request a completion.
-3. Validate that exactly one usable assistant choice exists.
-4. If the assistant returns tool calls, append the assistant message, execute calls in listed order, append one tool result per call, and request another completion.
-5. If no tool calls are returned, finish the turn.
+1. Persist an attempt with an absolute 120-second deadline, an immutable visible-input snapshot and `MODEL_MAX_ROUNDS` (default 6).
+2. Recover or create its Pi conversation/link and stable submission, then request completions through the project adapter.
+3. Validate the assistant choice; persist model and tool execution position in Pi.
+4. Execute non-terminal tools sequentially; block every effect in a response that mixes `send_message` with another tool.
+5. Continue ordinary text through `onYield`; only an independent send/silent call normally terminates the attempt.
 
-There is no tool-call-count limit. The model ends the turn by returning no more tool calls. Plain assistant `content` is not sent to QQ automatically; only `send_message` has an external messaging effect.
+Logical generation identity determines the round budget. Recovery does not add a round or renew the deadline. Provider/Pi automatic retries and compaction are disabled; business retries receive a new attempt. Only `send_message` has a QQ messaging effect.
 
 ## 14. Runtime tools
 
 ### `send_message`
 
 ```ts
-send_message({ content: string, reply_to_message_id?: string })
+send_message({ action: "send", content: "reply" })
+send_message({ action: "silent" })
 ```
 
-Sends plain text to the current Agent conversation. The model may invoke it multiple times, but the system prompt asks it to avoid unnecessary fragmentation except when the conversation naturally requires separate messages, such as a character-chain game.
+Records one terminal action for the current business turn. `send` sends one plain-text message; `silent` makes no network request. The turn-level delivery barrier prevents another successful or uncertain send even when a model call ID changes.
 
 The target conversation is never supplied by the model. The runtime derives it from Agent identity, preventing cross-conversation sends.
 
@@ -447,7 +448,7 @@ Each attempt receives a fresh 120-second deadline. Completed tool-call records a
 
 After all retries fail, the turn is marked `failed` and its inbound message rows remain retained. The runtime does not manufacture a user-facing apology unless the model successfully calls `send_message` in a later turn.
 
-Successful completion means the model returned no further tool calls, regardless of whether it sent a QQ message. The turn becomes `completed`, inbound rows become `visible`, and retention cleanup runs.
+Successful completion requires a persisted send/silent terminal decision. The turn becomes `completed` and inbound rows become `visible`; ordinary text is not a successful completion. Visible retention is amortized every tenth settled turn, while private Pi execution data is cleared after business settlement and execution quiescence.
 
 ## 17. Logging and observability
 

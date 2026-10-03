@@ -1,79 +1,55 @@
 # mikan-utsushi 当前项目分析
 
-## 结论
+## 当前实现
 
-仓库已完成冻结设计中的 MVP 主链路：QQ 群聊/C2C Webhook、独立 Agent、SQLite 收件箱、固定批处理、FIFO 轮次、OpenAI-compatible 工具循环、Memory、Exa 搜索、受限网页读取和 durable QQ 发送。
-
-当前主链路：
+QQ 群聊/C2C 主链路已切换为真实 Pi Durable Harness，运行在 Cloudflare Agents 的每会话 SQLite Durable Object 内。模型访问仍只经过项目 OpenAI-compatible Chat Completions adapter；Memory、Web 和 QQ 边界由项目代码强制。
 
 ```text
-QQ Webhook
-  -> 验签与标准化
-  -> qq:group:{group_openid} / qq:c2c:{user_openid} Agent
-  -> SQLite 去重与两秒固定合并
-  -> FIFO 模型轮次
-  -> memory_* / search_web / read_web / send_message
-  -> QQ 纯文本发送与可见历史
+QQ Webhook -> 验签与标准化 -> qq:group:* / qq:c2c:* Agent
+  -> qq_events 去重 + qq_messages 固定两秒不可变批次
+  -> qq_turns FIFO + qq_attempts 期限、预算、输入快照
+  -> Pi generation / tool task / submission 检查点
+  -> 项目模型 adapter + Memory / Web / QQ 工具
+  -> qq_deliveries 发送屏障 + 可见历史 + 终态执行正文清理
 ```
 
-## 当前能力
+## 状态与代码边界
 
-| 范围 | 当前状态 | 代码边界 |
-|---|---|---|
-| Worker 路由 | 已实现 | `apps/worker/src/index.ts` |
-| QQ 验签与标准化 | 已实现 | `packages/qqbot/src/signature.ts`、`normalize.ts` |
-| Agent 身份隔离 | 已实现 | `qq:group:*`、`qq:c2c:*` |
-| 持久接收与去重 | 已实现 | `GroupChatAgent.receiveMessage` |
-| 两秒批处理与 FIFO | 已实现 | `flushPending`、`runTurn`、`retryTurn` |
-| 模型工具循环 | 已实现 | `turn-runner.ts` 与 `model-provider` adapter |
-| 图片输入 | 已实现 | `context.ts` 的 vision gating |
-| Memory | 已实现 | `MemoryToolRuntime` 与 Agent SQLite |
-| Exa 搜索 | 已实现 | `packages/web-tools/src/exa-search.ts`，direct Worker fetch |
-| 网页读取 | 已实现 | URL/SSRF、重定向、MIME、大小、超时和 HTML 提取边界 |
-| QQ 发送 | 已实现 | `QQBotClient.sendText` 返回 sent/failed/unknown |
-| durable delivery | 已实现 | `outbound_deliveries`，`(turn_id, tool_call_id)` 幂等键 |
-| retention | 已实现 | 只删除最旧 visible chat rows |
-| 测试 | 已实现 | QQ client、Worker integration、group/C2C conversation flow |
+| 范围 | 当前实现 | 代码边界 |
+| --- | --- | --- |
+| Webhook 验签、归一化、ACK | 入库且安排处理后确认；调度失败的重复回调可修复 | `apps/worker/src/index.ts`、`packages/qqbot` |
+| 身份与队列 | 每群/C2C 独立新库；固定两秒、不可变批次、FIFO | `group-chat-agent.ts`、`schema.ts` |
+| 模型执行 | 独立 attempt conversation，稳定 request ID，真实 Pi 检查点恢复 | `pi-runtime.ts` |
+| 平台存储 adapter | Pi 0.99.2 同步事务合同，游标同步消费，失败回滚 | `pi-storage.ts` |
+| 模型协议 | 非流式 Chat Completions，完整 URL，最终 Pi 事件 | `packages/model-provider/src/pi-models.ts`、`openai-compatible.ts` |
+| 执行策略 | 120 秒持久绝对期限，默认 6 个逻辑 generation，显式 send/silent | `runtime-types.ts`、`pi-runtime.ts`、`env.ts` |
+| 图片与可见上下文 | 当前批次 vision gating；历史仅可见文本 | `context.ts` |
+| Memory | 当前群/成员范围，变更与重放结果收据同事务 | `tool-runtime.ts`、`qq_memories`、`qq_effect_receipts` |
+| Exa / read_web | direct fetch 与原有 URL、重定向、MIME、大小、超时边界 | `packages/web-tools` |
+| QQ 发送 | 网络前 planned；turn 级唯一屏障；明确失败可重试 | `QQBotClient`、`qq_deliveries` |
+| 数据清理 | 每十个终态 turn 清理可见历史；静止后清除 Pi 私有执行正文 | `group-chat-agent.ts`、`pi-storage.ts` |
+| 审计与调试 | 有界脱敏 `qq_tool_audit`；显式原始 `qq_turn_debug` | `pi-runtime.ts`、`tool-runtime.ts` |
 
-## 可靠性与安全边界
+Pi Durable、Pi AI、Chord 固定为 `0.99.2`，Agents 固定为 `0.23.0`。SDK 仍属 Experimental；版本升级必须重新验证存储接口和清理 schema，不能套用研究中的 1.0.0 异步接口。
 
-- Webhook 只有在消息持久化并安排处理后才返回 ACK；重复事件不进入模型或发送器。
-- 普通 assistant 文本没有 QQ 副作用，只有 `send_message` 能发送纯文本。
-- QQ HTTP 明确失败记录 `failed`；请求已发出但 timeout/transport 无法确认时记录 `outcome_unknown`，不自动重发。
-- 已成功或未知结果的 delivery 以及对应 turn 不会因模型后续失败而再次发送。
-- 每个工具调用在执行前写入 `tool_calls` 的 `running` 审计记录，执行后更新为 `completed` 或 `failed` 并保存 bounded/redacted 参数与结果元数据；不保存完整 arguments/results，审计记录也不进入后续聊天上下文。
-- Memory 只在当前 Agent 内按群和当前群成员隔离。
-- `read_web` 不携带凭据，重定向每次重新进行 URL policy 检查；网页内容是不可信工具输出。
-- 可见聊天记录受 `MESSAGE_RETENTION_LIMIT` 限制；Memory、turn、tool-call 和 delivery 审计记录不被清除。
+## 恢复与安全合同
 
-## 配置与部署
+- Pi 拥有模型/工具执行位置；业务表拥有队列、重试与最终结果。fiber 负责保活，持久调度按实际业务状态协调唤醒，不另建模型重放引擎。
+- 同一次尝试重开同一 conversation/submission，逻辑 generation 与绝对期限保持。失败重试按 5/30/120 秒创建新 attempt；SDK/provider 的额外自动重试与 compaction 关闭。
+- 普通模型文本继续执行；只有独立 `send_message(send|silent)` 正常终止。混合终止响应中的所有工具均不执行。
+- Memory 写入与收据原子提交，安全重放返回原结果。发送屏障按 turn 绑定，换 call/task ID 不会增加发送额度；重启 planned 收敛为 unknown，sent/unknown/silent 不重发。
+- 私有 Pi transcript、快照和重放结果用于在途恢复。业务终态且执行静止后按固定 schema 清理；去重墓碑、Memory、业务元数据、发送屏障和脱敏审计保留。
+- 默认审计不含原参数/结果或未知工具原名；显式 debug 与普通日志、后续聊天上下文隔离。网页内容始终没有权限或凭据能力。
 
-生产部署使用 Wrangler Secrets：
+## 验证与上线边界
 
-```text
-QQ_APP_ID
-QQ_APP_SECRET
-LLM_API_KEY
-EXA_API_KEY
-```
+本次验证只使用合成凭据、受控 HTTP 返回及独立本地 SQLite。全仓测试、typecheck、Wrangler dry-run 和独立 workerd smoke 的准确结果见 [验收报告](acceptance-report.md)。Worker 测试并发固定为 1，避免 Windows 下同时启动大量 workerd 导致连接重置。
 
-模型完整 URL、模型名、vision、上下文数量和 retention 使用环境变量。人格与聊天行为来自 `apps/worker/src/prompts/system-prompt.md`；项目不提供 dashboard 或在线设置 API。
-
-## 验证边界
-
-不使用真实 QQ、LLM、Exa、凭据或生产部署。完成门禁包括：
-
-```bash
-pnpm typecheck
-pnpm test
-pnpm --filter @mikan-utsushi/worker exec wrangler deploy --dry-run
-git diff --check
-```
-
-Wrangler 命令只执行生产 bundle dry-run，不会部署。
+当前代码只支持全新会话数据库，初始化会拒绝旧 schema。本次未导入、清空或操作旧数据，也未部署、发布回调或调用真实 QQ/LLM/Exa。生产 namespace/binding 切换、旧库处置和回滚兼容需另行制定方案。
 
 ## 相关文档
 
-- 产品需求：`docs/PRD.md`
-- 冻结设计：`docs/superpowers/specs/2026-09-15-qq-companion-runtime-design.md`
-- 实施计划：`docs/superpowers/plans/2026-09-15-qq-companion-runtime.md`
+- [产品需求](PRD.md)
+- [当前架构](architecture.md)
+- [全新数据库设计](superpowers/specs/2026-10-03-pi-durable-database-design.md)
+- [迁移与验收计划](superpowers/plans/2026-10-03-pi-durable-runtime-migration.md)

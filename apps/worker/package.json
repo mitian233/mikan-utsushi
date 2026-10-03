@@ -9,6 +9,9 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@earendil-works/chord": "0.99.2",
+    "@earendil-works/pi-ai": "0.99.2",
+    "@earendil-works/pi-durable": "0.99.2",
     "@mikan-utsushi/contracts": "workspace:*",
     "@mikan-utsushi/model-provider": "workspace:*",
     "@mikan-utsushi/qqbot": "workspace:*",

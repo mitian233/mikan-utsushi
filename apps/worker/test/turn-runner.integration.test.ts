@@ -1,140 +1,39 @@
-import { env, reset, runInDurableObject } from "cloudflare:test";
-import { afterEach, describe, expect, it } from "vitest";
-import type {
-  ChatCompletionResult,
-  ModelMessage,
-  ModelToolCall,
-  ModelToolDefinition,
-} from "@mikan-utsushi/model-provider";
-import { SYSTEM_PROMPT } from "../src/prompts";
-import { SCHEMA_STATEMENTS } from "../src/agents/schema";
-import type { ToolRuntime } from "../src/agents/turn-runner";
+import { env,reset,runInDurableObject } from 'cloudflare:test';
+import { afterEach,expect,it } from 'vitest';
+import type { GroupChatAgent } from '../src/agents/group-chat-agent';
+import type { PiCompletionClient,ModelMessage } from '@mikan-utsushi/model-provider';
+import type { RuntimeConfig } from '../src/env';
+import { fixtureConfig,fixtureMessage,fixtureCall,fixtureCompletion } from './runtime-fixtures';
 
-type TestAgent = {
-  executeTurn(turnId: string): Promise<{ hasSent: boolean; termination?: "sent" | "silent" }>;
-  getRuntimeConfig(): unknown;
-  createModelClient(config: unknown): {
-    complete: (
-      input: { messages: ModelMessage[]; tools: ModelToolDefinition[] },
-      signal: AbortSignal,
-    ) => Promise<ChatCompletionResult>;
-  };
-  createToolRuntime(): ToolRuntime;
-};
-
-function toolCall(id: string): ModelToolCall {
-  return {
-    id,
-    type: "function",
-    function: { name: "lookup", arguments: JSON.stringify({ value: "ignored" }) },
-  };
-}
-
-function completion(content: string | null, toolCalls: ModelToolCall[] = []): ChatCompletionResult {
-  return {
-    message: { role: "assistant", content, toolCalls },
-    usage: { totalTokens: 1 },
-  };
-}
-
-afterEach(async () => {
-  await reset();
+type TestAgent=Omit<GroupChatAgent,never>&{getRuntimeConfig():RuntimeConfig;createModelClient(config:RuntimeConfig):PiCompletionClient};
+afterEach(async()=>{await reset();});
+it('injects only recent visible history and binds member Memory to the immutable batch speaker',async()=>{
+ const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+ await runInDurableObject(ns.get(ns.idFromName('qq:group:fixture')),async(instance,state)=>{
+  const agent=instance as TestAgent,sql=state.storage.sql,inputs:ModelMessage[][]=[];
+  agent.schedule=async()=>({id:'controlled'} as never);agent.getRuntimeConfig=()=>({...fixtureConfig,contextMessageLimit:1});
+  agent.createModelClient=()=>({complete:async input=>{inputs.push(structuredClone(input.messages));return inputs.length === 1 ? fixtureCompletion([fixtureCall('memory_write',{scope:'user',content:'remember speaker'})]) : fixtureCompletion([fixtureCall('send_message',{action:'silent'})]);}});
+  sql.exec("INSERT INTO qq_turns(id,status,termination,created_at,settled_at) VALUES(1,'completed','silent',0,0)");
+  for(let index=1;index<=2;index++){sql.exec('INSERT INTO qq_events VALUES(?,?)',`history-${index}`,index);sql.exec("INSERT INTO qq_messages(direction,event_id,turn_id,batch_position,status,text,created_at) VALUES('inbound',?,1,?,'visible',?,?)",`history-${index}`,index,`visible-${index}`,index);}
+  await agent.receiveMessage({...fixtureMessage('first'),userId:'actual-member-openid'});
+  await agent.receiveMessage({...fixtureMessage('second'),userId:'another-member'});
+  await agent.flushPending();await agent.runTurn({turnId:'2'});
+  expect(inputs[0]).toContainEqual({role:'user',content:'visible-2'});
+  expect(inputs[0]).not.toContainEqual({role:'user',content:'visible-1'});
+  expect(inputs[0]).toContainEqual({role:'user',content:'first'});expect(inputs[0]).toContainEqual({role:'user',content:'second'});
+  expect(sql.exec('SELECT scope_kind,owner_id,content FROM qq_memories').toArray()).toEqual([{scope_kind:'user',owner_id:'actual-member-openid',content:'remember speaker'}]);
+ });
 });
-
-describe("GroupChatAgent.executeTurn integration", () => {
-  it("passes an immutable batch, visible history, and the real QQ speaker ID into the runner", async () => {
-    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-    const stub = namespace.get(namespace.idFromName("qq:group:task6-execute-turn"));
-
-    const observed = await runInDurableObject(stub, async (instance, state) => {
-      for (const statement of SCHEMA_STATEMENTS) state.storage.sql.exec(statement);
-      const agent = instance as unknown as TestAgent;
-      const turnId = "task6-turn-1";
-      const createdAt = Date.now();
-      state.storage.sql.exec(
-        `INSERT INTO turns (id, status, attempt_count, first_message_at, created_at)
-         VALUES (?, 'queued', 0, ?, ?)`,
-        turnId,
-        createdAt,
-        createdAt,
-      );
-      const rows = [
-        { id: 101, eventId: "task6-event-1", messageId: "task6-message-1", userId: "member-real-openid", text: "first" },
-        { id: 102, eventId: "task6-event-2", messageId: "task6-message-2", userId: "member-real-openid", text: "second" },
-        { id: 103, eventId: "task6-visible-event", messageId: "task6-visible-message", userId: null, text: "visible reply" },
-      ];
-      for (const row of rows) {
-        state.storage.sql.exec(
-          `INSERT INTO messages
-           (id, event_id, message_id, direction, chat_kind, chat_id, user_id, text, images_json, status, created_at)
-           VALUES (?, ?, ?, ?, 'group', 'task6-execute-turn', ?, ?, '[]', ?, ?)`,
-          row.id,
-          row.eventId,
-          row.messageId,
-          row.id === 103 ? "outbound" : "inbound",
-          row.userId,
-          row.text,
-          row.id === 103 ? "visible" : "batched",
-          createdAt + row.id,
-        );
-      }
-      state.storage.sql.exec(
-        "INSERT INTO turn_messages (turn_id, message_id, position) VALUES (?, ?, ?), (?, ?, ?)",
-        turnId,
-        101,
-        0,
-        turnId,
-        102,
-        1,
-      );
-
-      agent.getRuntimeConfig = () => ({
-        visionEnabled: false,
-        contextMessageLimit: 50,
-        llmUrl: "https://gateway.example/chat/completions",
-        llmApiKey: "test-key",
-        model: "test-model",
-      });
-      const completions: ModelMessage[][] = [];
-      agent.createModelClient = () => ({
-        complete: async (input) => {
-          completions.push(structuredClone(input.messages));
-          return completions.length === 1
-            ? completion(null, [toolCall("unknown-call")])
-            : completion(null, [
-                {
-                  id: "silent-call",
-                  type: "function",
-                  function: { name: "send_message", arguments: JSON.stringify({ action: "silent" }) },
-                },
-              ]);
-        },
-      });
-      const defaultRuntime = agent.createToolRuntime();
-      let executionContext: { turnId: string; speakerId?: string; signal: AbortSignal } | undefined;
-      agent.createToolRuntime = () => ({
-        execute: async (call, context) => {
-          executionContext = context;
-          return defaultRuntime.execute(call, context);
-        },
-      });
-
-      const result = await agent.executeTurn(turnId);
-      return { result, completions, executionContext };
-    });
-
-    expect(observed.result).toEqual({ hasSent: false, termination: "silent" });
-    expect(observed.executionContext?.turnId).toBe("task6-turn-1");
-    expect(observed.executionContext?.speakerId).toBe("member-real-openid");
-    expect(observed.completions[0]).toContainEqual({ role: "system", content: SYSTEM_PROMPT });
-    expect(observed.completions[0]).toContainEqual({ role: "user", content: "first" });
-    expect(observed.completions[0]).toContainEqual({ role: "user", content: "second" });
-    expect(observed.completions[0]).toContainEqual({ role: "assistant", content: "visible reply" });
-    expect(observed.completions[0]).not.toContainEqual({ role: "assistant", content: "tool result" });
-    expect(observed.completions[1]).toContainEqual({
-      role: "tool",
-      tool_call_id: "unknown-call",
-      content: JSON.stringify({ error: "Unknown tool", name: "lookup" }),
-    });
-  });
+it('denies an unknown capability, continues the run, and preserves a redacted failed tool audit',async()=>{
+ const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+ await runInDurableObject(ns.get(ns.idFromName('qq:group:fixture')),async(instance,state)=>{
+  const agent=instance as TestAgent;let calls=0;
+  agent.schedule=async()=>({id:'controlled'} as never);agent.getRuntimeConfig=()=>fixtureConfig;
+  agent.createModelClient=()=>({complete:async()=>{calls++;return calls === 1 ? fixtureCompletion([fixtureCall('unregistered-PRIVATE-NAME',{content:'PRIVATE-ARGUMENT'})]) : fixtureCompletion([fixtureCall('send_message',{action:'silent'})]);}});
+  await agent.receiveMessage(fixtureMessage('test'));await agent.flushPending();await agent.runTurn({turnId:'1'});
+  expect(calls).toBe(2);
+  const audits=state.storage.sql.exec('SELECT name,status,arguments_meta_json,result_meta_json FROM qq_tool_audit ORDER BY name').toArray();
+  expect(audits).toContainEqual(expect.objectContaining({name:'unknown',status:'failed'}));
+  expect(JSON.stringify(audits)).not.toContain('PRIVATE-NAME');expect(JSON.stringify(audits)).not.toContain('PRIVATE-ARGUMENT');
+ });
 });

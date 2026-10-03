@@ -1,157 +1,70 @@
-import { env, reset, runInDurableObject } from "cloudflare:test";
-import { afterEach, describe, expect, it } from "vitest";
-import { MemoryToolRuntime, MEMORY_TOOL_DEFINITIONS } from "../src/agents/tool-runtime";
-import { SCHEMA_STATEMENTS } from "../src/agents/schema";
+import { env,reset,runInDurableObject } from 'cloudflare:test';
+import { afterEach,expect,it } from 'vitest';
+import { MemoryToolRuntime } from '../src/agents/tool-runtime';
+import { seedAttempt,fixtureCall } from './runtime-fixtures';
 
-const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-
-const context = (speakerId = "member-a") => ({
-  turnId: "turn-memory",
-  speakerId,
-  signal: new AbortController().signal,
+afterEach(async()=>{await reset();});
+it('searches only current group/member scopes, escapes LIKE, and rejects another member mutations',async()=>{
+ const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+ await runInDurableObject(ns.get(ns.idFromName('qq:group:fixture')),async(_instance,state)=>{
+  const {context}=seedAttempt(state.storage),sql=state.storage.sql;
+  const runtime=new MemoryToolRuntime(sql,{transactionSync:fn=>state.storage.transactionSync(fn)});
+  const run=async(name:string,args:Record<string,unknown>,task:number)=>JSON.parse((await runtime.execute(fixtureCall(name,args),{...context,toolTaskId:task})).content);
+  const group=await run('memory_write',{scope:'group',content:'shared %_ literal'},100);
+  const user=await run('memory_write',{scope:'user',content:'member private'},101);
+  sql.exec("INSERT INTO qq_memories VALUES('other','user','another-member','hidden',NULL,0,0)");
+  expect(await run('memory_search',{scope:'group',query:'%_'},102)).toEqual([group]);
+  expect(await run('memory_search',{scope:'user'},103)).toEqual([user]);
+  expect(await run('memory_update',{id:'other',content:'overwrite'},104)).toMatchObject({error:'Memory not found'});
+  expect(await run('memory_delete',{id:'other'},105)).toMatchObject({error:'Memory not found'});
+  expect(sql.exec("SELECT content FROM qq_memories WHERE id='other'").toArray()).toEqual([{content:'hidden'}]);
+  const updated=await run('memory_update',{id:user.id,content:'changed'},106);
+  expect(updated).toMatchObject({id:user.id,content:'changed',scope:'user:member'});
+  const deleted=await run('memory_delete',{id:user.id},107);
+  expect(deleted).toEqual({id:user.id,deleted:true});
+  expect(await run('memory_delete',{id:user.id},107)).toEqual(deleted);
+ });
 });
-
-function initializeSchema(state: { storage: { sql: SqlStorage } }): void {
-  for (const statement of SCHEMA_STATEMENTS) state.storage.sql.exec(statement);
-}
-
-function call(name: string, argumentsValue: Record<string, unknown>) {
-  return {
-    id: `call-${name}`,
-    type: "function" as const,
-    function: { name, arguments: JSON.stringify(argumentsValue) },
-  };
-}
-
-afterEach(async () => {
-  await reset();
+it('returns the original receipt after Memory changes and rejects changed replay arguments',async()=>{
+ const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+ await runInDurableObject(ns.get(ns.idFromName('qq:group:fixture')),async(_instance,state)=>{
+  const {context}=seedAttempt(state.storage),runtime=new MemoryToolRuntime(state.storage.sql,{transactionSync:fn=>state.storage.transactionSync(fn)});
+  const call=fixtureCall('memory_write',{scope:'group',content:'original'});
+  const first=await runtime.execute(call,context),record=JSON.parse(first.content);
+  await runtime.execute(fixtureCall('memory_update',{id:record.id,content:'later'}),{...context,toolTaskId:101});
+  expect(await runtime.execute(call,context)).toEqual(first);
+  expect(JSON.parse((await runtime.execute(fixtureCall('memory_write',{scope:'group',content:'changed'}),context)).content)).toMatchObject({error:'Inconsistent or retired effect receipt'});
+  expect(state.storage.sql.exec('SELECT content FROM qq_memories').toArray()).toEqual([{content:'later'}]);
+ });
 });
-
-describe("scoped memory tools", () => {
-  it("exposes conversation history search alongside memory tools", () => {
-    expect(MEMORY_TOOL_DEFINITIONS.map((tool) => tool.function.name)).toContain("conversation_search");
-    expect(JSON.stringify(MEMORY_TOOL_DEFINITIONS)).toContain("limit");
-  });
-
-  it("exposes only group and current-user memory scopes", () => {
-    expect(MEMORY_TOOL_DEFINITIONS.map((tool) => tool.function.name)).toEqual([
-      "memory_search",
-      "memory_write",
-      "memory_update",
-      "memory_delete",
-      "conversation_search",
-    ]);
-    expect(JSON.stringify(MEMORY_TOOL_DEFINITIONS)).not.toContain("user_id");
-  });
-
-  it("isolates group and member memories", async () => {
-    const stub = namespace.get(namespace.idFromName("memory-isolation"));
-    const result = await runInDurableObject(stub, async (_agent, state) => {
-      initializeSchema(state);
-      const runtime = new MemoryToolRuntime(state.storage.sql);
-      await runtime.execute(call("memory_write", { scope: "group", content: "群昵称是柚子" }), context("member-a"));
-      await runtime.execute(call("memory_write", { scope: "user", content: "喜欢 TypeScript" }), context("member-a"));
-
-      const group = await runtime.execute(call("memory_search", { scope: "group", query: "" }), context("member-b"));
-      const memberB = await runtime.execute(call("memory_search", { scope: "user", query: "" }), context("member-b"));
-      const memberA = await runtime.execute(call("memory_search", { scope: "user", query: "" }), context("member-a"));
-      return {
-        group: JSON.parse(group.content) as unknown,
-        memberB: JSON.parse(memberB.content) as unknown,
-        memberA: JSON.parse(memberA.content) as unknown,
-      };
-    });
-
-    expect(result.group).toEqual(expect.arrayContaining([
-      expect.objectContaining({ scope: "group", content: "群昵称是柚子" }),
-    ]));
-    expect(result.memberB).toEqual([]);
-    expect(result.memberA).toEqual(expect.arrayContaining([
-      expect.objectContaining({ scope: "user:member-a", content: "喜欢 TypeScript" }),
-    ]));
-  });
-
-  it("escapes LIKE metacharacters and returns empty queries by recency", async () => {
-    const stub = namespace.get(namespace.idFromName("memory-escaping"));
-    const result = await runInDurableObject(stub, async (_agent, state) => {
-      initializeSchema(state);
-      const runtime = new MemoryToolRuntime(state.storage.sql);
-      await runtime.execute(call("memory_write", { scope: "group", content: "literal %_\\ marker" }), context());
-      await runtime.execute(call("memory_write", { scope: "group", content: "newest" }), context());
-      const literal = await runtime.execute(call("memory_search", { scope: "group", query: "%_\\" }), context());
-      const recent = await runtime.execute(call("memory_search", { scope: "group" }), context());
-      return { literal: JSON.parse(literal.content), recent: JSON.parse(recent.content) };
-    });
-
-    expect(result.literal).toEqual(expect.arrayContaining([
-      expect.objectContaining({ content: "literal %_\\ marker" }),
-    ]));
-    expect(result.recent[0]).toEqual(expect.objectContaining({ content: "newest" }));
-  });
-
-  it("enforces ownership for update and delete", async () => {
-    const stub = namespace.get(namespace.idFromName("memory-ownership"));
-    const result = await runInDurableObject(stub, async (_agent, state) => {
-      initializeSchema(state);
-      const runtime = new MemoryToolRuntime(state.storage.sql);
-      const written = await runtime.execute(call("memory_write", { scope: "user", content: "private" }), context("member-a"));
-      const memory = JSON.parse(written.content) as { id: string };
-      const deniedUpdate = await runtime.execute(
-        call("memory_update", { id: memory.id, content: "stolen" }),
-        context("member-b"),
-      );
-      const deniedDelete = await runtime.execute(call("memory_delete", { id: memory.id }), context("member-b"));
-      const allowedUpdate = await runtime.execute(
-        call("memory_update", { id: memory.id, content: "updated" }),
-        context("member-a"),
-      );
-      return {
-        deniedUpdate: JSON.parse(deniedUpdate.content),
-        deniedDelete: JSON.parse(deniedDelete.content),
-        allowedUpdate: JSON.parse(allowedUpdate.content),
-      };
-    });
-
-    expect(result.deniedUpdate).toMatchObject({ error: "Memory not found" });
-    expect(result.deniedDelete).toMatchObject({ error: "Memory not found" });
-    expect(result.allowedUpdate).toMatchObject({ content: "updated", scope: "user:member-a" });
-  });
-
-  it("searches visible conversation messages with a bounded result set", async () => {
-    const stub = namespace.get(namespace.idFromName("conversation-search"));
-    const result = await runInDurableObject(stub, async (_agent, state) => {
-      initializeSchema(state);
-      state.storage.sql.exec(
-        `INSERT INTO messages
-         (event_id, direction, chat_kind, chat_id, text, images_json, status, created_at)
-         VALUES (?, 'inbound', 'group', ?, ?, '[]', 'visible', ?),
-                (?, 'outbound', 'group', ?, ?, '[]', 'visible', ?),
-                (?, 'inbound', 'group', ?, ?, '[]', 'visible', ?),
-                (?, 'inbound', 'group', ?, ?, '[]', 'failed', ?)`,
-        "event-1", "group-1", "旧计划：迁移数据库", 100,
-        "event-2", "group-1", "已经完成迁移", 200,
-        "event-3", "group-1", "新的发布计划", 300,
-        "event-4", "group-1", "失败消息不应出现", 400,
-      );
-      const runtime = new MemoryToolRuntime(state.storage.sql);
-      const searched = await runtime.execute(
-        call("conversation_search", { query: "计划", limit: 1 }),
-        context(),
-      );
-      return JSON.parse(searched.content) as unknown;
-    });
-
-    expect(result).toEqual([
-      expect.objectContaining({ text: "新的发布计划", direction: "inbound" }),
-    ]);
-  });
-
-  it("does not create memories without an explicit memory tool call", async () => {
-    const stub = namespace.get(namespace.idFromName("memory-no-auto-write"));
-    const count = await runInDurableObject(stub, (_agent, state) => {
-      initializeSchema(state);
-      return state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM memories").toArray()[0]?.count ?? 0;
-    });
-    expect(count).toBe(0);
-  });
+it('rolls back Memory and receipt together if durable receipt insertion fails',async()=>{
+ const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+ await runInDurableObject(ns.get(ns.idFromName('qq:group:fixture')),async(_instance,state)=>{
+  const {context}=seedAttempt(state.storage);
+  state.storage.sql.exec("CREATE TRIGGER fail_receipt BEFORE INSERT ON qq_effect_receipts BEGIN SELECT RAISE(ABORT,'controlled failure'); END");
+  const runtime=new MemoryToolRuntime(state.storage.sql,{transactionSync:fn=>state.storage.transactionSync(fn)});
+  await runtime.execute(fixtureCall('memory_write',{scope:'group',content:'rollback'}),context);
+  expect(state.storage.sql.exec('SELECT content FROM qq_memories').toArray()).toEqual([]);
+  expect(state.storage.sql.exec('SELECT tool_task_id FROM qq_effect_receipts').toArray()).toEqual([]);
+ });
+});
+it('searches visible history with literal keywords, exclusive timestamps and a bounded limit',async()=>{
+ const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+ await runInDurableObject(ns.get(ns.idFromName('qq:group:fixture')),async(_instance,state)=>{
+  const {context}=seedAttempt(state.storage),sql=state.storage.sql;
+  sql.exec("INSERT INTO qq_turns(id,status,termination,created_at,settled_at) VALUES(2,'completed','silent',0,0)");
+  for(let index=1;index<=40;index++){
+   sql.exec('INSERT INTO qq_events VALUES(?,?)',String(index),index);
+   sql.exec("INSERT INTO qq_messages(direction,event_id,turn_id,batch_position,status,text,created_at) VALUES('inbound',?,2,?,'visible',?,?)",String(index),index,index === 20 ? 'literal %_' : `chat ${index}`,index);
+  }
+  sql.exec("INSERT INTO qq_events VALUES('pending',0)");
+  sql.exec("INSERT INTO qq_messages(direction,event_id,status,text,created_at) VALUES('inbound','pending','pending','hidden',50)");
+  const runtime=new MemoryToolRuntime(sql,{transactionSync:fn=>state.storage.transactionSync(fn)});
+  const search=async(args:Record<string,unknown>)=>JSON.parse((await runtime.execute(fixtureCall('conversation_search',args),context)).content);
+  expect((await search({query:'%_'})).map((row:{text:string})=>row.text)).toEqual(['literal %_']);
+  expect((await search({after:35,before:40,limit:2})).map((row:{text:string})=>row.text)).toEqual(['chat 38','chat 39']);
+  expect((await search({})).map((row:{createdAt:number})=>row.createdAt)).toEqual(Array.from({length:30},(_,index)=>index+11));
+  expect(await search({limit:31})).toHaveProperty('error');
+  expect(await search({after:20,before:20})).toHaveProperty('error');
+ });
 });

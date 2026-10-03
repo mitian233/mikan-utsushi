@@ -1,597 +1,251 @@
 import type { ChatMessage } from "@mikan-utsushi/contracts";
-import { OpenAICompatibleClient } from "@mikan-utsushi/model-provider";
+import { OpenAICompatibleClient, type PiCompletionClient } from "@mikan-utsushi/model-provider";
 import { QQBotClient } from "@mikan-utsushi/qqbot";
-import { Agent } from "agents";
-import { SYSTEM_PROMPT } from "../prompts";
+import { Agent, type FiberRecoveryContext, type Schedule } from "agents";
 import { parseRuntimeConfig, type Env, type RuntimeConfig } from "../env";
 import { buildInitialModelMessages, type ContextMessage } from "./context";
-import {
-  runToolLoop,
-  type ToolCallAuditEvent,
-  type ToolRuntime,
-  type TurnDebugEvent,
-} from "./turn-runner";
-import {
-  MEMORY_TOOL_DEFINITIONS,
-  MemoryToolRuntime,
-  SEND_MESSAGE_TOOL_DEFINITION,
-  hashAuditIdentifier,
-  sanitizeAuditToolName,
-  summarizeToolArguments,
-  summarizeToolResult,
-  WEB_TOOL_DEFINITIONS,
-} from "./tool-runtime";
-import { SCHEMA_STATEMENTS } from "./schema";
+import { initializeSchema } from "./schema";
+import { PiRuntime } from "./pi-runtime";
+import { MemoryToolRuntime } from "./tool-runtime";
+import type { AttemptRow, ConversationIdentity, ToolRuntime, TurnExecutionResult } from "./runtime-types";
 
-const DEBOUNCE_SECONDS = 2;
-const SERIALIZATION_RETRY_SECONDS = 1;
-
-/**
- * Retention scans read `messageRetentionLimit` rows to find the cutoff, so
- * running one after every turn is the single largest source of Durable Object
- * row reads. Batching them keeps the newest window bounded while making the
- * amortized per-turn cost `limit / interval`.
- */
-const RETENTION_CLEANUP_INTERVAL_TURNS = 10;
-const RETENTION_CLEANUP_KEY = "retention_turns_since_cleanup";
-
-export type TurnExecutionResult = {
-  hasSent: boolean;
-  termination?: "sent" | "silent";
-  error?: unknown;
-};
-
-export function retryDelaySeconds(attemptCount: number): number | null {
-  return [5, 30, 120][attemptCount - 1] ?? null;
+export function retryDelaySeconds(attemptCount:number):number|null {
+  return [5,30,120][attemptCount-1] ?? null;
+}
+interface MessageRow extends Record<string,string|number|null> {
+  id:number; direction:"inbound"|"outbound"; status:ContextMessage["status"];
+  text:string|null; images_json:string; user_id:string|null; username:string|null;
+  platform_message_id:string|null; reply_required:number; reply_to_message_id:string|null; quote_reference_id:string|null;
+}
+interface TurnRow extends Record<string,string|number|null> {
+  id:number; status:string; attempt_count:number; retry_at:number|null;
 }
 
-export class GroupChatAgent extends Agent<Env, Record<string, never>> {
-  onStart(): void {
-    this.ensureSchema();
+export class GroupChatAgent extends Agent<Env,Record<string,never>> {
+  private processing?:Promise<void>;
+  private host?:PiRuntime;
+  private hostOpening?:Promise<PiRuntime>;
+  private qqClient?:QQBotClient;
+  private scheduling:Promise<void>=Promise.resolve();
+
+  constructor(ctx:DurableObjectState,env:Env) {
+    super(ctx,env);
+    initializeSchema(ctx.storage);
   }
 
-  async receiveMessage(message: ChatMessage): Promise<{ accepted: true; duplicate: boolean }> {
-    this.ensureSchema();
-    const agentIdentity = this.agentIdentity();
-    if (agentIdentity.chatKind !== message.chatKind || agentIdentity.chatId !== message.chatId) {
-      throw new Error("Conversation identity mismatch");
-    }
-    const existingIdentity = await this.ctx.storage.get<ConversationIdentity>(CONVERSATION_IDENTITY_KEY);
-    if (existingIdentity && (existingIdentity.chatKind !== agentIdentity.chatKind || existingIdentity.chatId !== agentIdentity.chatId)) {
-      throw new Error("Conversation identity mismatch");
-    }
-    if (!existingIdentity) await this.ctx.storage.put(CONVERSATION_IDENTITY_KEY, agentIdentity);
-
-    const inserted = this.ctx.storage.sql.exec(
-      `INSERT OR IGNORE INTO messages
-       (event_id, message_id, direction, chat_kind, chat_id, user_id, username, text,
-        images_json, reply_to_message_id, reply_required, quote_reference_id, status, timestamp, created_at)
-       VALUES (?, ?, 'inbound', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-      message.eventId,
-      message.messageId,
-      message.chatKind,
-      message.chatId,
-      message.userId,
-      message.username ?? null,
-      message.text ?? null,
-      JSON.stringify(message.images ?? []),
-      message.replyToMessageId ?? null,
-      message.requiresReply ? 1 : 0,
-      message.quoteReferenceId ?? null,
-      message.timestamp,
-      Date.now(),
-    );
-
-    if (inserted.rowsWritten === 0) {
-      await this.scheduleFlushIfPending();
-      return { accepted: true, duplicate: true };
-    }
-
-    try {
-      await this.scheduleFlushIfPending();
-    } catch (error) {
-      this.ctx.storage.sql.exec("DELETE FROM messages WHERE event_id = ?", message.eventId);
-      throw error;
-    }
-
-    return { accepted: true, duplicate: false };
+  async onStart():Promise<void> {
+    // The constructor initializes SQL before SDK recovery hooks or direct RPC.
+    await this.arrangeWork();
   }
 
-  async flushPending(): Promise<void> {
-    this.ensureSchema();
-    await this.ctx.storage.put("processor_scheduled", false);
-    if (this.hasBusyTurn()) return;
-
-    const pending = this.ctx.storage.sql
-      .exec<{ id: number; timestamp: number | null }>(
-        "SELECT id, timestamp FROM messages WHERE status = 'pending' ORDER BY id",
-      )
-      .toArray();
-
-    if (pending.length === 0) return;
-
-    const turnId = crypto.randomUUID();
-    const firstMessageAt = pending[0]?.timestamp ?? Date.now();
-    const latestTurn = this.ctx.storage.sql
-      .exec<{ created_at: number | null }>("SELECT MAX(created_at) AS created_at FROM turns")
-      .toArray()[0]?.created_at ?? 0;
-    const createdAt = Math.max(Date.now(), latestTurn + 1);
-    this.ctx.storage.sql.exec(
-      `INSERT INTO turns (id, status, attempt_count, first_message_at, created_at)
-       VALUES (?, 'queued', 0, ?, ?)`,
-      turnId,
-      firstMessageAt,
-      createdAt,
-    );
-
-    try {
-      for (const [position, message] of pending.entries()) {
-        this.ctx.storage.sql.exec(
-          "INSERT INTO turn_messages (turn_id, message_id, position) VALUES (?, ?, ?)",
-          turnId,
-          message.id,
-          position,
-        );
-        this.ctx.storage.sql.exec(
-          "UPDATE messages SET status = 'batched', turn_id = ? WHERE id = ? AND status = 'pending'",
-          turnId,
-          message.id,
-        );
-      }
-
-      await this.schedule(0, "runTurn", { turnId });
-    } catch (error) {
-      this.ctx.storage.sql.exec("DELETE FROM turn_messages WHERE turn_id = ?", turnId);
-      this.ctx.storage.sql.exec("DELETE FROM turns WHERE id = ?", turnId);
-      this.ctx.storage.sql.exec(
-        "UPDATE messages SET status = 'pending', turn_id = NULL WHERE turn_id = ?",
-        turnId,
-      );
-      try {
-        await this.scheduleFlushIfPending();
-      } catch {
-        // The marker remains clear when recovery scheduling also fails. A
-        // duplicate callback can call receiveMessage again and retry it.
-      }
-      throw error;
-    }
-
-    await this.scheduleFlushIfPending();
+  async receiveMessage(message:ChatMessage):Promise<{accepted:true;duplicate:boolean}> {
+    await this.lifecycle.start();
+    const identity=this.agentIdentity();
+    if (identity.chatKind !== message.chatKind || identity.chatId !== message.chatId) throw new Error("Conversation identity mismatch");
+    const duplicate=this.ctx.storage.transactionSync(()=>{
+      const sql=this.ctx.storage.sql;
+      const existing=sql.exec<{chat_kind:string;chat_id:string}>("SELECT chat_kind,chat_id FROM qq_identity WHERE singleton=1").toArray()[0];
+      if (existing && (existing.chat_kind !== identity.chatKind || existing.chat_id !== identity.chatId)) throw new Error("Conversation identity mismatch");
+      sql.exec("INSERT OR IGNORE INTO qq_identity VALUES(1,1,?,?,?)",identity.chatKind,identity.chatId,Date.now());
+      const event=sql.exec("INSERT OR IGNORE INTO qq_events(event_id,received_at) VALUES(?,?)",message.eventId,Date.now());
+      if (!event.rowsWritten) return true;
+      sql.exec(`INSERT INTO qq_messages(direction,event_id,platform_message_id,status,user_id,username,text,images_json,reply_required,reply_to_message_id,quote_reference_id,platform_timestamp,created_at)
+        VALUES('inbound',?,?,'pending',?,?,?,?,?,?,?,?,?)`,message.eventId,message.messageId,message.userId,message.username ?? null,message.text ?? null,
+        JSON.stringify(message.images ?? []),message.requiresReply ? 1 : 0,message.requiresReply ? message.messageId : message.replyToMessageId ?? null,message.quoteReferenceId ?? null,message.timestamp,Date.now());
+      return false;
+    });
+    // Failed scheduling leaves the durable event intact. Its redelivery repairs the wakeup.
+    await this.arrangeWork();
+    return {accepted:true,duplicate};
   }
 
-  async runTurn(payload: { turnId: string }): Promise<void> {
-    this.ensureSchema();
-    const turn = this.ctx.storage.sql
-      .exec<{ id: string; status: string; attempt_count: number; created_at: number }>(
-        "SELECT id, status, attempt_count, created_at FROM turns WHERE id = ?",
-        payload.turnId,
-      )
-      .toArray()[0];
-    if (!turn || (turn.status !== "queued" && turn.status !== "retry_wait")) return;
-
-    const activeTurn = this.ctx.storage.sql
-      .exec<{ id: string }>("SELECT id FROM turns WHERE status = 'running' LIMIT 1")
-      .toArray()[0];
-    if (activeTurn && activeTurn.id !== payload.turnId) {
-      await this.schedule(SERIALIZATION_RETRY_SECONDS, "runTurn", payload);
-      return;
-    }
-
-    const earlierQueued = this.ctx.storage.sql
-      .exec<{ id: string }>(
-        `SELECT id FROM turns
-         WHERE status IN ('queued', 'retry_wait') AND created_at < ?
-         ORDER BY created_at, id LIMIT 1`,
-        turn.created_at,
-      )
-      .toArray()[0];
-    if (earlierQueued && earlierQueued.id !== payload.turnId) {
-      await this.schedule(SERIALIZATION_RETRY_SECONDS, "runTurn", payload);
-      return;
-    }
-
-    const attemptCount = turn.attempt_count + 1;
-    this.ctx.storage.sql.exec(
-      `UPDATE turns
-       SET status = 'running', attempt_count = ?, started_at = ?, last_error = NULL
-       WHERE id = ? AND status IN ('queued', 'retry_wait')`,
-      attemptCount,
-      Date.now(),
-      payload.turnId,
-    );
-
-    let outcome: TurnExecutionResult;
-    try {
-      outcome = await this.executeTurn(payload.turnId);
-    } catch (error) {
-      outcome = { hasSent: false, error };
-    }
-
-    const persistedHasSent = this.turnHasSent(payload.turnId);
-    const hasSent = persistedHasSent || outcome.hasSent;
-    if (outcome.error !== undefined) {
-      const errorText = errorMessage(outcome.error);
-      this.recordTurnError(payload.turnId, errorText);
-      if (hasSent) {
-        this.markTurnFailed(payload.turnId, errorText, true);
-        await this.flushPending();
-        return;
-      }
-
-      const delay = retryDelaySeconds(attemptCount);
-      if (delay === null) {
-        this.markTurnFailed(payload.turnId, errorText);
-        await this.flushPending();
-        return;
-      }
-
-      this.ctx.storage.sql.exec(
-        "UPDATE turns SET status = 'retry_wait', last_error = ? WHERE id = ?",
-        errorText,
-        payload.turnId,
-      );
-      try {
-        await this.schedule(delay, "retryTurn", payload);
-      } catch (scheduleError) {
-        this.markTurnFailed(payload.turnId, errorMessage(scheduleError));
-        await this.flushPending();
-      }
-      return;
-    }
-
-    this.ctx.storage.sql.exec(
-      `UPDATE turns
-       SET status = 'completed', completed_at = ?, terminal = 1, termination = ?,
-           has_sent = CASE WHEN has_sent = 1 OR ? = 1 THEN 1 ELSE 0 END
-       WHERE id = ?`,
-      Date.now(),
-      outcome.termination ?? "sent",
-      outcome.hasSent ? 1 : 0,
-      payload.turnId,
-    );
-    this.ctx.storage.sql.exec(
-      "UPDATE messages SET status = 'visible' WHERE turn_id = ? AND status = 'batched'",
-      payload.turnId,
-    );
-    await this.maybeCleanupVisibleMessages();
-    await this.flushPending();
+  async flushPending(_payload?:unknown,schedule?:Schedule<unknown>):Promise<void> {
+    await this.lifecycle.start();
+    if (schedule) await this.cancelSchedule(schedule.id);
+    this.ctx.storage.transactionSync(()=>{
+      const sql=this.ctx.storage.sql;
+      const messages=sql.exec<{id:number}>("SELECT id FROM qq_messages WHERE status='pending' ORDER BY id").toArray();
+      if (!messages.length) return;
+      const turn=sql.exec<{id:number}>("INSERT INTO qq_turns(status,created_at) VALUES('queued',?) RETURNING id",Date.now()).toArray()[0]!;
+      for (let position=0;position<messages.length;position++) sql.exec("UPDATE qq_messages SET status='batched',turn_id=?,batch_position=? WHERE id=? AND status='pending'",turn.id,position,messages[position]!.id);
+    });
+    await this.arrangeWork();
   }
 
-  private async maybeCleanupVisibleMessages(): Promise<void> {
-    const elapsed = (await this.ctx.storage.get<number>(RETENTION_CLEANUP_KEY) ?? 0) + 1;
-    if (elapsed < RETENTION_CLEANUP_INTERVAL_TURNS) {
-      await this.ctx.storage.put(RETENTION_CLEANUP_KEY, elapsed);
-      return;
-    }
-
-    await this.ctx.storage.put(RETENTION_CLEANUP_KEY, 0);
-    this.cleanupVisibleMessages(this.retentionLimit());
+  private arrangeWork():Promise<void> {
+    const work=this.scheduling.then(async()=>{
+      const sql=this.ctx.storage.sql;
+      const pending=sql.exec<{created_at:number}>("SELECT created_at FROM qq_messages WHERE status='pending' ORDER BY id LIMIT 1").toArray()[0];
+      const active=sql.exec<TurnRow>("SELECT id,status,attempt_count,retry_at FROM qq_turns WHERE status IN ('active','retry_wait') LIMIT 1").toArray()[0];
+      const queued=!active && sql.exec("SELECT id FROM qq_turns WHERE status='queued' ORDER BY id LIMIT 1").toArray().length > 0;
+      const cleanup=sql.exec("SELECT turn_id FROM qq_attempts WHERE settled_at IS NOT NULL AND input_snapshot_json IS NOT NULL AND turn_id IN (SELECT id FROM qq_turns WHERE status IN ('completed','failed')) LIMIT 1").toArray().length > 0;
+      const schedules=await this.listSchedules();
+      const arm=async(callback:"flushPending"|"wakeProcessor",at:number|undefined)=>{
+        const existing=schedules.filter(schedule=>schedule.callback === callback);
+        if (at === undefined) {for (const schedule of existing) await this.cancelSchedule(schedule.id);return;}
+        if (existing.length && existing[0]!.time*1000 <= at) return;
+        for (const schedule of existing) await this.cancelSchedule(schedule.id);
+        await this.schedule(new Date(Math.max(Date.now(),at)),callback,{}, {idempotent:true});
+      };
+      await arm("flushPending",pending ? pending.created_at+2000 : undefined);
+      let wake:number|undefined;
+      if (active?.status === "retry_wait") wake=active.retry_at!;
+      else if (active) {
+        const deadline=sql.exec<{deadline_at:number}>("SELECT deadline_at FROM qq_attempts WHERE turn_id=? AND attempt=?",active.id,active.attempt_count).toArray()[0]?.deadline_at;
+        wake=this.processing ? Math.min(deadline ?? Date.now(),Date.now()+30000) : Date.now();
+      } else if (queued || cleanup) wake=Date.now();
+      await arm("wakeProcessor",wake);
+    });
+    this.scheduling=work.catch(()=>{});
+    return work;
   }
 
-  async retryTurn(payload: { turnId: string }): Promise<void> {
-    this.ensureSchema();
-    const turn = this.ctx.storage.sql
-      .exec<{ status: string }>("SELECT status FROM turns WHERE id = ?", payload.turnId)
-      .toArray()[0];
+  async wakeProcessor(_payload?:unknown,schedule?:Schedule<unknown>):Promise<void> {
+    await this.lifecycle.start();
+    if (schedule) await this.cancelSchedule(schedule.id);
+    if (this.processing) {await this.arrangeWork();return;}
+    const run=this.runFiber("qq-pi-processor",async fiber=>{
+      fiber.stash({kind:"qq-pi-processor"});
+      await this.processQueue();
+    });
+    this.processing=run;
+    this.ctx.waitUntil(run.finally(()=>{this.processing=undefined;}));
+  }
+
+  async onFiberRecovered(_context:FiberRecoveryContext):Promise<void> {
+    await this.arrangeWork();
+  }
+
+  async runTurn(_payload:{turnId:string}):Promise<void> {
+    await this.wakeProcessor();
+    await this.processing;
+  }
+
+  async retryTurn(payload:{turnId:string}):Promise<void> {
+    const turn=this.ctx.storage.sql.exec<TurnRow>("SELECT id,status,attempt_count,retry_at FROM qq_turns WHERE id=?",payload.turnId).toArray()[0];
     if (!turn || turn.status !== "retry_wait") return;
-
-    this.ctx.storage.sql.exec("UPDATE turns SET status = 'queued' WHERE id = ?", payload.turnId);
     await this.runTurn(payload);
   }
 
-  async executeTurn(turnId: string): Promise<TurnExecutionResult> {
-    const runtimeConfig = this.getRuntimeConfig();
-    const turnRows = this.ctx.storage.sql
-      .exec<StoredMessageRow>(
-        `SELECT m.id, m.message_id, m.direction, m.status, m.text, m.images_json, m.user_id, m.reply_required, m.quote_reference_id
-         FROM turn_messages tm
-         JOIN messages m ON m.id = tm.message_id
-         WHERE tm.turn_id = ?
-         ORDER BY tm.position`,
-        turnId,
-      )
-      .toArray();
-    const recentRows = this.ctx.storage.sql
-      .exec<StoredMessageRow>(
-        `SELECT id, message_id, direction, status, text, images_json, user_id, reply_required, quote_reference_id
-         FROM messages
-         WHERE status = 'visible'
-         ORDER BY created_at DESC, id DESC
-         LIMIT ?`,
-        runtimeConfig.contextMessageLimit,
-      )
-      .toArray()
-      .reverse();
-    const turnMessages = turnRows.map(toContextMessage);
-    const recentVisibleMessages = recentRows.map(toContextMessage);
-    const conversationIdentity = this.agentIdentity();
-    const messages = buildInitialModelMessages({
-      systemPrompt: SYSTEM_PROMPT,
-      runtimeConfig,
-      turnMessages,
-      recentVisibleMessages,
-    });
-    const client = this.createModelClient(runtimeConfig);
-    const runtime = this.createToolRuntime(runtimeConfig);
-    const result = await runToolLoop({
-      client,
-      messages,
-      tools: [...MEMORY_TOOL_DEFINITIONS, ...WEB_TOOL_DEFINITIONS, SEND_MESSAGE_TOOL_DEFINITION],
-      runtime,
-      maxRounds: runtimeConfig.modelMaxRounds,
-      context: {
-        turnId,
-        speakerId: turnMessages.find((message) => message.direction === "inbound")?.userId ?? undefined,
-        requiredReplyToMessageId: turnRows.find((row) => row.direction === "inbound" && row.reply_required === 1)?.message_id ?? undefined,
-        requiredQuoteReferenceId: turnRows.find((row) => row.direction === "inbound" && row.reply_required === 1)?.quote_reference_id ?? undefined,
-        chatKind: conversationIdentity?.chatKind,
-        chatId: conversationIdentity?.chatId,
-      },
-      onToolCall: (event) => this.persistToolCallAudit(turnId, event),
-      onDebug: (event) => this.persistTurnDebug(turnId, event),
-    });
-    return { hasSent: result.sentCount > 0, termination: result.termination };
+  private async processQueue():Promise<void> {
+    try {
+      for (;;) {
+        await this.cleanupTerminalAttempts();
+        const sql=this.ctx.storage.sql;
+        let turn=sql.exec<TurnRow>("SELECT id,status,attempt_count,retry_at FROM qq_turns WHERE status IN ('active','retry_wait') LIMIT 1").toArray()[0];
+        if (turn?.status === "retry_wait" && turn.retry_at! > Date.now()) break;
+        if (!turn) turn=sql.exec<TurnRow>("SELECT id,status,attempt_count,retry_at FROM qq_turns WHERE status='queued' ORDER BY id LIMIT 1").toArray()[0];
+        if (!turn) break;
+        const terminal=sql.exec<{status:string}>("SELECT status FROM qq_deliveries WHERE turn_id=?",turn.id).toArray()[0];
+        if (terminal && ["sent","outcome_unknown","silent"].includes(terminal.status)) {
+          this.settleTurn(turn,{hasSent:terminal.status !== "silent",termination:terminal.status === "silent" ? "silent" : "sent"});
+          continue;
+        }
+        if (turn.status !== "active") {
+          let config:RuntimeConfig;
+          try {config=this.getRuntimeConfig();}
+          catch {this.settleTurn(turn,{hasSent:false,error:new Error("configuration")},true);continue;}
+          this.claimAttempt(turn,config);
+          turn={...turn,status:"active",attempt_count:turn.attempt_count+1,retry_at:null};
+        }
+        await this.arrangeWork();
+        let outcome:TurnExecutionResult;
+        try {outcome=await this.executeTurn(String(turn.id));}
+        catch {outcome={hasSent:false,error:new Error("runtime_failed")};}
+        this.settleTurn(turn,outcome);
+        await this.arrangeWork();
+      }
+    } finally {
+      if (this.host) {await this.host.close();this.host=undefined;}
+      await this.arrangeWork();
+    }
   }
 
-  protected getRuntimeConfig(): RuntimeConfig {
-    return parseRuntimeConfig(this.env);
-  }
-
-  protected createModelClient(config: RuntimeConfig): OpenAICompatibleClient {
-    return new OpenAICompatibleClient({
-      url: config.llmUrl,
-      apiKey: config.llmApiKey,
-      model: config.model,
+  private claimAttempt(turn:TurnRow,config:RuntimeConfig):void {
+    this.ctx.storage.transactionSync(()=>{
+      const sql=this.ctx.storage.sql,now=Date.now();
+      const rows=sql.exec<MessageRow>("SELECT * FROM qq_messages WHERE turn_id=? AND direction='inbound' ORDER BY batch_position",turn.id).toArray();
+      const history=sql.exec<MessageRow>("SELECT * FROM qq_messages WHERE status='visible' ORDER BY created_at DESC,id DESC LIMIT ?",config.contextMessageLimit).toArray().reverse();
+      const snapshot=buildInitialModelMessages({runtimeConfig:config,turnMessages:rows.map(toContextMessage),recentVisibleMessages:history.map(toContextMessage)});
+      const reply=rows.find(row=>row.reply_required === 1),attempt=turn.attempt_count+1;
+      sql.exec("UPDATE qq_turns SET status='active',attempt_count=?,retry_at=NULL,error_code=NULL WHERE id=?",attempt,turn.id);
+      sql.exec(`INSERT INTO qq_attempts(turn_id,attempt,request_id,started_at,deadline_at,model,max_rounds,vision_enabled,context_limit,speaker_id,reply_to_message_id,quote_reference_id,input_snapshot_json)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,turn.id,attempt,`qq-turn:${turn.id}:attempt:${attempt}`,now,now+120000,config.model,config.modelMaxRounds,config.visionEnabled?1:0,config.contextMessageLimit,
+        rows[0]?.user_id ?? null,reply?.platform_message_id ?? null,reply?.quote_reference_id ?? null,JSON.stringify(snapshot));
     });
   }
 
-  private qqClient?: QQBotClient;
-
-  private async persistToolCallAudit(turnId: string, event: ToolCallAuditEvent): Promise<void> {
-    const [auditTurnId, auditCallId] = await Promise.all([
-      hashAuditIdentifier(turnId),
-      hashAuditIdentifier(event.call.id),
-    ]);
-    const auditToolName = sanitizeAuditToolName(event.call.function.name);
-    const resultJson = event.result
-      ? summarizeToolResult(auditToolName, event.result.content)
-      : summarizeToolResult(auditToolName, JSON.stringify({ error: errorMessage(event.error) }));
-    if (event.status === "running") {
-      this.ctx.storage.sql.exec(
-        `INSERT OR IGNORE INTO tool_calls
-         (turn_id, id, name, arguments_json, status, created_at)
-         VALUES (?, ?, ?, ?, 'running', ?)`,
-        auditTurnId,
-        auditCallId,
-        auditToolName,
-        summarizeToolArguments(auditToolName, event.call.function.arguments),
-        Date.now(),
-      );
-      return;
-    }
-    this.ctx.storage.sql.exec(
-      `UPDATE tool_calls
-       SET result_json = ?, status = ?, completed_at = ?
-       WHERE turn_id = ? AND id = ?`,
-      resultJson,
-      event.status,
-      Date.now(),
-      auditTurnId,
-      auditCallId,
-    );
-  }
-
-  protected createToolRuntime(config?: RuntimeConfig): ToolRuntime {
-    if (config && !this.qqClient) {
-      this.qqClient = new QQBotClient({
-        appId: config.qqAppId,
-        appSecret: config.qqAppSecret,
-        apiBase: config.qqApiBase,
-        tokenUrl: config.qqTokenUrl,
-      });
-    }
-    return new MemoryToolRuntime(this.ctx.storage.sql, {
-      exaApiKey: config?.exaApiKey,
-      qqClient: this.qqClient,
-      transactionSync: (closure) => this.ctx.storage.transactionSync(closure),
+  private settleTurn(turn:TurnRow,outcome:TurnExecutionResult,configurationFailure=false):void {
+    const sql=this.ctx.storage.sql,now=Date.now();
+    const delivery=sql.exec<{status:string}>("SELECT status FROM qq_deliveries WHERE turn_id=?",turn.id).toArray()[0];
+    const termination=delivery && ["sent","outcome_unknown","silent"].includes(delivery.status) ? delivery.status === "silent" ? "silent" : "sent" : outcome.termination;
+    const message=outcome.error instanceof Error ? outcome.error.message : "runtime_failed";
+    const errorCode=["deadline","max_rounds","model_failed","runtime_failed","configuration"].includes(message) ? message : "runtime_failed";
+    const delay=!termination && !configurationFailure ? retryDelaySeconds(turn.attempt_count) : null;
+    this.ctx.storage.transactionSync(()=>{
+      sql.exec("UPDATE qq_attempts SET settled_at=?,error_code=? WHERE turn_id=? AND attempt=? AND settled_at IS NULL",now,termination ? null : errorCode,turn.id,turn.attempt_count);
+      if (termination) {
+        sql.exec("UPDATE qq_turns SET status='completed',termination=?,retry_at=NULL,error_code=NULL,settled_at=? WHERE id=?",termination,now,turn.id);
+        sql.exec("UPDATE qq_messages SET status='visible' WHERE turn_id=? AND direction='inbound' AND status='batched'",turn.id);
+      } else if (delay !== null) sql.exec("UPDATE qq_turns SET status='retry_wait',retry_at=?,error_code=? WHERE id=?",now+delay*1000,errorCode,turn.id);
+      else {
+        sql.exec("UPDATE qq_turns SET status='failed',retry_at=NULL,error_code=?,settled_at=? WHERE id=?",errorCode,now,turn.id);
+        sql.exec("UPDATE qq_messages SET status='failed' WHERE turn_id=? AND direction='inbound' AND status='batched'",turn.id);
+      }
+      if (!termination && this.env.TURN_DEBUG_ENABLED === "true" && turn.attempt_count > 0) sql.exec("INSERT INTO qq_turn_debug(turn_id,attempt,round,event,payload_json,created_at) VALUES(?,?,0,'turn_error',?,?)",turn.id,turn.attempt_count,JSON.stringify({code:errorCode}),now);
+      if (termination || delay === null) this.cleanupVisibleMessages(turn.id);
     });
   }
 
-  private retentionLimit(): number {
-    try {
-      return this.getRuntimeConfig().messageRetentionLimit;
-    } catch {
-      return 5000;
+  async executeTurn(turnId:string):Promise<TurnExecutionResult> {
+    const attempt=this.ctx.storage.sql.exec<AttemptRow>("SELECT a.* FROM qq_attempts a JOIN qq_turns t ON t.id=a.turn_id WHERE a.turn_id=? AND t.status='active' AND t.attempt_count=a.attempt",turnId).toArray()[0];
+    if (!attempt) throw new Error("Missing active QQ attempt");
+    return (await this.openHost(attempt.model)).runAttempt(attempt);
+  }
+
+  private async openHost(model:string):Promise<PiRuntime> {
+    if (this.host) return this.host;
+    if (!this.hostOpening) {
+      const config={...this.getRuntimeConfig(),model};
+      this.hostOpening=PiRuntime.open(this.ctx.storage,{model,client:this.createModelClient(config),runtime:this.createToolRuntime(config),identity:this.agentIdentity(),debugEnabled:config.turnDebugEnabled});
+    }
+    try {this.host=await this.hostOpening;return this.host;}
+    finally {this.hostOpening=undefined;}
+  }
+
+  private async cleanupTerminalAttempts():Promise<void> {
+    const attempts=this.ctx.storage.sql.exec<AttemptRow>("SELECT a.* FROM qq_attempts a JOIN qq_turns t ON t.id=a.turn_id WHERE t.status IN ('completed','failed') AND a.input_snapshot_json IS NOT NULL ORDER BY a.turn_id,a.attempt").toArray();
+    for (const attempt of attempts) {
+      const host=await this.openHost(attempt.model);
+      try {await host.cleanupAttempt(attempt);} finally {this.host=undefined;}
     }
   }
 
-  private cleanupVisibleMessages(limit: number): void {
-    this.ctx.storage.sql.exec(
-      `DELETE FROM messages
-       WHERE id IN (
-         SELECT id FROM messages
-         WHERE status = 'visible'
-         ORDER BY created_at DESC, id DESC
-         LIMIT -1 OFFSET ?
-       )`,
-      limit,
-    );
+  protected getRuntimeConfig():RuntimeConfig {return parseRuntimeConfig(this.env);}
+  protected createModelClient(config:RuntimeConfig):PiCompletionClient {
+    return new OpenAICompatibleClient({url:config.llmUrl,apiKey:config.llmApiKey,model:config.model});
+  }
+  protected createToolRuntime(config?:RuntimeConfig):ToolRuntime {
+    if (config && !this.qqClient) this.qqClient=new QQBotClient({appId:config.qqAppId,appSecret:config.qqAppSecret,apiBase:config.qqApiBase,tokenUrl:config.qqTokenUrl});
+    return new MemoryToolRuntime(this.ctx.storage.sql,{exaApiKey:config?.exaApiKey,qqClient:this.qqClient,transactionSync:fn=>this.ctx.storage.transactionSync(fn)});
   }
 
-  private turnHasSent(turnId: string): boolean {
-    return (
-      this.ctx.storage.sql
-        .exec<{ has_sent: number }>("SELECT has_sent FROM turns WHERE id = ?", turnId)
-        .toArray()[0]?.has_sent === 1
-    );
+  private cleanupVisibleMessages(turnId:number):void {
+    if (turnId % 10 !== 0) return;
+    const limit=this.getRuntimeConfig().messageRetentionLimit;
+    this.ctx.storage.sql.exec("DELETE FROM qq_messages WHERE id IN (SELECT id FROM qq_messages WHERE status='visible' ORDER BY created_at DESC,id DESC LIMIT -1 OFFSET ?)",limit);
   }
 
-  private hasBusyTurn(): boolean {
-    return this.ctx.storage.sql
-      .exec<{ id: string }>(
-        "SELECT id FROM turns WHERE status IN ('queued', 'running', 'retry_wait') LIMIT 1",
-      )
-      .toArray().length > 0;
-  }
-
-  private async scheduleFlushIfPending(): Promise<void> {
-    const pending = this.ctx.storage.sql
-      .exec<{ id: number }>("SELECT id FROM messages WHERE status = 'pending' LIMIT 1")
-      .toArray();
-    if (pending.length === 0) {
-      await this.ctx.storage.delete("processor_scheduled");
-      return;
-    }
-
-    if (this.hasBusyTurn()) return;
-    if (await this.ctx.storage.get<boolean>("processor_scheduled")) return;
-
-    await this.ctx.storage.put("processor_scheduled", true);
-    try {
-      await this.schedule(DEBOUNCE_SECONDS, "flushPending", {});
-    } catch (error) {
-      await this.ctx.storage.delete("processor_scheduled");
-      throw error;
-    }
-  }
-
-  private turnDebugEnabled(): boolean {
-    try {
-      return this.getRuntimeConfig().turnDebugEnabled;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Persists an unredacted model request/response trace so an operator can
-   * inspect it in the Durable Object SQLite console. Disabled unless
-   * TURN_DEBUG_ENABLED is explicitly "true"; while disabled this is a no-op.
-   */
-  private persistTurnDebug(turnId: string, event: TurnDebugEvent): void {
-    if (!this.turnDebugEnabled()) return;
-    let payload: string;
-    try {
-      payload = JSON.stringify(event.payload) ?? String(event.payload);
-    } catch {
-      payload = String(event.payload);
-    }
-    this.ctx.storage.sql.exec(
-      `INSERT INTO turn_debug (turn_id, attempt_count, round, event, payload, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      turnId,
-      this.currentAttemptCount(turnId),
-      event.round,
-      event.event,
-      payload,
-      Date.now(),
-    );
-  }
-
-  private recordTurnError(turnId: string, error: string): void {
-    if (!this.turnDebugEnabled()) return;
-    this.ctx.storage.sql.exec(
-      `INSERT INTO turn_debug (turn_id, attempt_count, round, event, payload, created_at)
-       VALUES (?, ?, 0, 'turn_error', ?, ?)`,
-      turnId,
-      this.currentAttemptCount(turnId),
-      JSON.stringify({ message: error }),
-      Date.now(),
-    );
-  }
-
-  private currentAttemptCount(turnId: string): number {
-    return (
-      this.ctx.storage.sql
-        .exec<{ attempt_count: number }>("SELECT attempt_count FROM turns WHERE id = ?", turnId)
-        .toArray()[0]?.attempt_count ?? 0
-    );
-  }
-
-  private markTurnFailed(turnId: string, error: string, hasSent = false): void {
-    this.ctx.storage.sql.exec(
-      `UPDATE turns
-       SET status = 'failed', completed_at = ?, last_error = ?, has_sent = CASE WHEN ? THEN 1 ELSE has_sent END
-       WHERE id = ?`,
-      Date.now(),
-      error,
-      hasSent ? 1 : 0,
-      turnId,
-    );
-    this.ctx.storage.sql.exec(
-      "UPDATE messages SET status = 'failed' WHERE turn_id = ? AND status = 'batched'",
-      turnId,
-    );
-  }
-
-  private ensureSchema(): void {
-    for (const statement of SCHEMA_STATEMENTS) {
-      this.ctx.storage.sql.exec(statement);
-    }
-    // Existing Durable Objects need the new terminal outcome columns too.
-    try { this.ctx.storage.sql.exec("ALTER TABLE turns ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0"); } catch { /* already migrated */ }
-    try { this.ctx.storage.sql.exec("ALTER TABLE turns ADD COLUMN termination TEXT"); } catch { /* already migrated */ }
-    try { this.ctx.storage.sql.exec("ALTER TABLE messages ADD COLUMN reply_required INTEGER NOT NULL DEFAULT 0"); } catch { /* already migrated */ }
-    try { this.ctx.storage.sql.exec("ALTER TABLE messages ADD COLUMN quote_reference_id TEXT"); } catch { /* already migrated */ }
-  }
-
-  private agentIdentity(): ConversationIdentity {
-    const name = this.ctx.id.name;
+  private agentIdentity():ConversationIdentity {
+    const name=this.ctx.id.name;
     if (typeof name !== "string") throw new Error("Invalid QQ Agent identity");
-    const groupPrefix = "qq:group:";
-    const c2cPrefix = "qq:c2c:";
-    if (name.startsWith(groupPrefix) && name.length > groupPrefix.length) {
-      return { chatKind: "group", chatId: name.slice(groupPrefix.length) };
-    }
-    if (name.startsWith(c2cPrefix) && name.length > c2cPrefix.length) {
-      return { chatKind: "c2c", chatId: name.slice(c2cPrefix.length) };
-    }
+    if (name.startsWith("qq:group:") && name.length > 9) return {chatKind:"group",chatId:name.slice(9)};
+    if (name.startsWith("qq:c2c:") && name.length > 7) return {chatKind:"c2c",chatId:name.slice(7)};
     throw new Error("Invalid QQ Agent identity");
   }
 }
 
-const CONVERSATION_IDENTITY_KEY = "conversation_identity";
-
-type ConversationIdentity = {
-  chatKind: "group" | "c2c";
-  chatId: string;
-};
-
-interface StoredMessageRow extends Record<string, string | number | null> {
-  id: number;
-  direction: "inbound" | "outbound";
-  status: ContextMessage["status"];
-  text: string | null;
-  images_json: string;
-  user_id: string | null;
-  message_id: string | null;
-  reply_required: number;
-  quote_reference_id: string | null;
-}
-
-function toContextMessage(row: StoredMessageRow): ContextMessage {
-  let images: Array<{ url: string }> = [];
-  try {
-    const parsed = JSON.parse(row.images_json) as unknown;
-    if (Array.isArray(parsed)) {
-      images = parsed.filter(
-        (image): image is { url: string } =>
-          typeof image === "object" && image !== null && typeof (image as { url?: unknown }).url === "string",
-      );
-    }
-  } catch {
-    images = [];
-  }
-  return {
-    id: String(row.id),
-    direction: row.direction,
-    status: row.status,
-    text: row.text,
-    images,
-    userId: row.user_id,
-  };
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function toContextMessage(row:MessageRow):ContextMessage {
+  const images=(JSON.parse(row.images_json) as unknown[]).filter((value):value is {url:string}=>typeof value === "object" && value !== null && "url" in value && typeof value.url === "string");
+  return {id:String(row.id),direction:row.direction,status:row.status,text:row.text,images,userId:row.user_id,username:row.username};
 }

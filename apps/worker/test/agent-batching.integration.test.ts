@@ -1,426 +1,107 @@
 import { env, reset, runInDurableObject } from "cloudflare:test";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ChatMessage } from "@mikan-utsushi/contracts";
-import { GroupChatAgent, retryDelaySeconds } from "../src/agents/group-chat-agent";
+import { afterEach, expect, it } from "vitest";
+import type { GroupChatAgent } from "../src/agents/group-chat-agent";
+import type { RuntimeConfig } from "../src/env";
+import type { PiCompletionClient } from "@mikan-utsushi/model-provider";
+import { fixtureConfig,fixtureMessage,fixtureCall,fixtureCompletion,seedAttempt } from "./runtime-fixtures";
 
-const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-
-type ScheduleCall = unknown[];
-type TurnExecutionResult = { hasSent: boolean; error?: unknown };
-type TestAgent = GroupChatAgent & {
-  executeTurn(turnId: string): Promise<TurnExecutionResult>;
-  schedule(...args: unknown[]): Promise<unknown>;
-};
-
-function message(id: string, timestamp = Date.parse("2026-09-15T00:00:00.000Z")): ChatMessage {
-  return {
-    platform: "qq",
-    eventId: `event-${id}`,
-    messageId: `message-${id}`,
-    chatKind: "group",
-    chatId: "batching-group",
-    userId: "member-1",
-    username: "Mikan",
-    text: id,
-    images: [],
-    timestamp,
-  };
+type TestAgent=Omit<GroupChatAgent,never>&{getRuntimeConfig():RuntimeConfig;createModelClient(config:RuntimeConfig):PiCompletionClient};
+afterEach(async()=>{await reset();});
+async function withAgent(callback:(agent:TestAgent,state:DurableObjectState)=>Promise<void>):Promise<void>{
+ const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+ await runInDurableObject(ns.get(ns.idFromName('qq:group:fixture')),async(instance,state)=>{
+  const agent=instance as TestAgent;
+  agent.getRuntimeConfig=()=>fixtureConfig;
+  agent.createModelClient=()=>({complete:async()=>fixtureCompletion([fixtureCall('send_message',{action:'silent'})])});
+  await callback(agent,state);
+ });
 }
-
-async function withAgent<T>(callback: (agent: TestAgent, state: DurableObjectState) => Promise<T>): Promise<T> {
-  const stub = namespace.get(namespace.idFromName("qq:group:batching-group"));
-  return runInDurableObject(stub, (instance, state) => callback(instance as unknown as TestAgent, state));
-}
-
-function rows<T extends Record<string, unknown>>(state: DurableObjectState, sql: string): T[] {
-  return state.storage.sql.exec<T>(sql).toArray();
-}
-
-async function seedMessage(agent: TestAgent, item: ChatMessage): Promise<void> {
-  await agent.receiveMessage(item);
-}
-
-afterEach(async () => {
-  vi.useRealTimers();
-  await reset();
+it('rejects mismatched first and subsequent identities',async()=>{
+ await withAgent(async(agent,state)=>{
+  await expect(agent.receiveMessage(fixtureMessage('wrong','c2c','other'))).rejects.toThrow('Conversation identity mismatch');
+  expect(state.storage.sql.exec('SELECT * FROM qq_identity').toArray()).toEqual([]);
+  await agent.receiveMessage(fixtureMessage('valid'));
+  await expect(agent.receiveMessage(fixtureMessage('wrong','group','other'))).rejects.toThrow('Conversation identity mismatch');
+  expect(state.storage.sql.exec('SELECT event_id FROM qq_events').toArray()).toEqual([{event_id:'event-valid'}]);
+ });
 });
-
-describe("GroupChatAgent batching and retries", () => {
-  it("rejects a message from a different conversation identity in the same Agent", async () => {
-    await withAgent(async (agent) => {
-      agent.schedule = async () => undefined;
-      await expect(agent.receiveMessage(message("identity-first"))).resolves.toMatchObject({ accepted: true });
-      await expect(agent.receiveMessage({
-        ...message("identity-second"),
-        chatKind: "c2c",
-        chatId: "different-user",
-        userId: "different-user",
-      })).rejects.toThrow("Conversation identity mismatch");
-    });
-  });
-
-  it("rejects a first message whose payload does not match the fixed Agent identity", async () => {
-    const stub = namespace.get(namespace.idFromName("qq:group:fixed-group"));
-    const result = await runInDurableObject(stub, async (instance, state) => {
-      const agent = instance as unknown as TestAgent;
-      agent.schedule = async () => undefined;
-      await expect(agent.receiveMessage({
-        ...message("wrong-first"),
-        chatId: "attacker-group",
-      })).rejects.toThrow("Conversation identity mismatch");
-      return {
-        messages: rows<{ event_id: string }>(state, "SELECT event_id FROM messages"),
-        identity: await state.storage.get("conversation_identity"),
-      };
-    });
-
-    expect(result.messages).toEqual([]);
-    expect(result.identity).toBeUndefined();
-  });
-
-  it("accepts a first message matching a fixed C2C Agent identity", async () => {
-    const stub = namespace.get(namespace.idFromName("qq:c2c:fixed-user"));
-    const result = await runInDurableObject(stub, async (instance, state) => {
-      const agent = instance as unknown as TestAgent;
-      agent.schedule = async () => undefined;
-      const accepted = await agent.receiveMessage({
-        ...message("c2c-first"),
-        chatKind: "c2c",
-        chatId: "fixed-user",
-        userId: "fixed-user",
-      });
-      return {
-        accepted,
-        messages: rows<{ chat_kind: string; chat_id: string }>(state, "SELECT chat_kind, chat_id FROM messages"),
-        identity: await state.storage.get("conversation_identity"),
-      };
-    });
-
-    expect(result.accepted).toEqual({ accepted: true, duplicate: false });
-    expect(result.messages).toEqual([{ chat_kind: "c2c", chat_id: "fixed-user" }]);
-    expect(result.identity).toEqual({ chatKind: "c2c", chatId: "fixed-user" });
-  });
-
-  it("uses the fixed retry schedule", () => {
-    expect(retryDelaySeconds(1)).toBe(5);
-    expect(retryDelaySeconds(2)).toBe(30);
-    expect(retryDelaySeconds(3)).toBe(120);
-    expect(retryDelaySeconds(4)).toBeNull();
-  });
-
-  it("claims all messages in the two-second window in insertion order", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-09-15T00:00:00.000Z"));
-    const result = await withAgent(async (agent, state) => {
-      const scheduleCalls: ScheduleCall[] = [];
-      agent.schedule = async (...args: unknown[]) => {
-        scheduleCalls.push(args);
-      };
-
-      await seedMessage(agent, message("message-1"));
-      await vi.advanceTimersByTimeAsync(1_500);
-      await seedMessage(agent, message("message-2"));
-      await vi.advanceTimersByTimeAsync(500);
-      await agent.flushPending();
-
-      const turns = rows<{ id: string; status: string }>(state, "SELECT id, status FROM turns ORDER BY created_at, id");
-      const turnMessages = rows<{ turn_id: string; message_id: number; position: number }>(
-        state,
-        "SELECT turn_id, message_id, position FROM turn_messages ORDER BY position",
-      );
-      const messages = rows<{ message_id: string; status: string; turn_id: string }>(
-        state,
-        "SELECT message_id, status, turn_id FROM messages ORDER BY id",
-      );
-
-      return { scheduleCalls, turns, turnMessages, messages };
-    });
-
-    expect(result.turns).toHaveLength(1);
-    expect(result.turns[0]?.status).toBe("queued");
-    expect(result.turnMessages).toHaveLength(2);
-    expect(result.turnMessages.map((row) => row.position)).toEqual([0, 1]);
-    expect(result.messages.map((row) => row.message_id)).toEqual(["message-message-1", "message-message-2"]);
-    expect(result.messages.every((row) => row.status === "batched")).toBe(true);
-    expect(result.messages.every((row) => row.turn_id === result.turns[0]?.id)).toBe(true);
-    expect(result.scheduleCalls.at(-1)).toEqual([0, "runTurn", { turnId: result.turns[0]?.id }]);
-  });
-
-  it("keeps later messages in a second immutable turn", async () => {
-    const result = await withAgent(async (agent, state) => {
-      agent.schedule = async () => undefined;
-      await seedMessage(agent, message("message-1"));
-      await agent.flushPending();
-      agent.executeTurn = async () => ({ hasSent: false });
-      const firstTurnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
-      await agent.runTurn({ turnId: firstTurnId });
-      await seedMessage(agent, message("message-2"));
-      await agent.flushPending();
-
-      return {
-        turns: rows<{ id: string; status: string }>(state, "SELECT id, status FROM turns ORDER BY created_at, id"),
-        turnMessages: rows<{ turn_id: string; message_id: number; position: number }>(
-          state,
-          "SELECT turn_id, message_id, position FROM turn_messages ORDER BY message_id, position",
-        ),
-        messages: rows<{ message_id: string; turn_id: string; status: string }>(
-          state,
-          "SELECT message_id, turn_id, status FROM messages ORDER BY id",
-        ),
-      };
-    });
-
-    expect(result.turns).toHaveLength(2);
-    expect(result.turnMessages).toHaveLength(2);
-    expect(result.turnMessages.map((row) => row.turn_id)).toEqual([result.turns[0]?.id, result.turns[1]?.id]);
-    expect(result.messages.map((row) => row.turn_id)).toEqual([result.turns[0]?.id, result.turns[1]?.id]);
-    expect(result.messages.map((row) => row.status)).toEqual(["visible", "batched"]);
-  });
-
-  it("does not run the same turn concurrently when its callback is duplicated", async () => {
-    await withAgent(async (agent, state) => {
-      agent.schedule = async () => undefined;
-      await seedMessage(agent, message("message-1"));
-      await agent.flushPending();
-      const turnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
-      let active = 0;
-      let maxActive = 0;
-      let release!: () => void;
-      const blocked = new Promise<void>((resolve) => { release = resolve; });
-      agent.executeTurn = async () => {
-        active += 1;
-        maxActive = Math.max(maxActive, active);
-        await blocked;
-        active -= 1;
-        return { hasSent: false };
-      };
-
-      const first = agent.runTurn({ turnId });
-      await Promise.resolve();
-      const duplicate = agent.runTurn({ turnId });
-      await duplicate;
-      expect(maxActive).toBe(1);
-      release();
-      await first;
-      expect(rows<{ status: string }>(state, "SELECT status FROM turns")[0]?.status).toBe("completed");
-    });
-  });
-
-  it("preserves turn message membership through retries", async () => {
-    const result = await withAgent(async (agent, state) => {
-      const scheduleCalls: ScheduleCall[] = [];
-      agent.schedule = async (...args: unknown[]) => {
-        scheduleCalls.push(args);
-      };
-      await seedMessage(agent, message("message-1"));
-      await agent.flushPending();
-      const turnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
-      agent.executeTurn = async () => { throw new Error("model unavailable"); };
-
-      await agent.runTurn({ turnId });
-      const afterFirstFailure = rows<{ status: string; attempt_count: number }>(
-        state,
-        "SELECT status, attempt_count FROM turns WHERE id = '" + turnId + "'",
-      )[0];
-      const firstMembership = rows<{ message_id: number; position: number }>(
-        state,
-        `SELECT message_id, position FROM turn_messages WHERE turn_id = '${turnId}' ORDER BY position`,
-      );
-      await agent.retryTurn({ turnId });
-      const afterSecondFailure = rows<{ status: string; attempt_count: number }>(
-        state,
-        `SELECT status, attempt_count FROM turns WHERE id = '${turnId}'`,
-      )[0];
-      const secondMembership = rows<{ message_id: number; position: number }>(
-        state,
-        `SELECT message_id, position FROM turn_messages WHERE turn_id = '${turnId}' ORDER BY position`,
-      );
-
-      return { scheduleCalls, afterFirstFailure, afterSecondFailure, firstMembership, secondMembership };
-    });
-
-    expect(result.afterFirstFailure).toEqual({ status: "retry_wait", attempt_count: 1 });
-    expect(result.afterSecondFailure).toEqual({ status: "retry_wait", attempt_count: 2 });
-    expect(result.scheduleCalls).toContainEqual([5, "retryTurn", expect.any(Object)]);
-    expect(result.scheduleCalls).toContainEqual([30, "retryTurn", expect.any(Object)]);
-    expect(result.secondMembership).toEqual(result.firstMembership);
-  });
-
-  it("marks a turn failed without retrying after the third retry or after send", async () => {
-    const result = await withAgent(async (agent, state) => {
-      const scheduleCalls: ScheduleCall[] = [];
-      agent.schedule = async (...args: unknown[]) => {
-        scheduleCalls.push(args);
-      };
-      await seedMessage(agent, message("message-1"));
-      await agent.flushPending();
-      const turnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
-      agent.executeTurn = async () => { throw new Error("model unavailable"); };
-      await agent.runTurn({ turnId });
-      await agent.retryTurn({ turnId });
-      await agent.retryTurn({ turnId });
-      await agent.retryTurn({ turnId });
-      const exhausted = rows<{ status: string; attempt_count: number; has_sent: number }>(state, `SELECT status, attempt_count, has_sent FROM turns WHERE id = '${turnId}'`)[0];
-
-      await seedMessage(agent, message("message-2"));
-      await agent.flushPending();
-      const sentTurnId = rows<{ id: string }>(state, "SELECT id FROM turns ORDER BY created_at, id")[1]!.id;
-      agent.executeTurn = async (): Promise<TurnExecutionResult> => ({ hasSent: true, error: new Error("post-send failure") });
-      await agent.runTurn({ turnId: sentTurnId });
-      const postSend = rows<{ status: string; attempt_count: number; has_sent: number }>(state, `SELECT status, attempt_count, has_sent FROM turns WHERE id = '${sentTurnId}'`)[0];
-
-      return { scheduleCalls, exhausted, postSend };
-    });
-
-    expect(result.exhausted).toEqual({ status: "failed", attempt_count: 4, has_sent: 0 });
-    expect(result.postSend).toEqual({ status: "failed", attempt_count: 1, has_sent: 1 });
-    expect(result.scheduleCalls.filter((call) => call[1] === "retryTurn")).toHaveLength(3);
-  });
-
-  it("uses persisted has_sent when execution fails after send_message", async () => {
-    const result = await withAgent(async (agent, state) => {
-      const scheduleCalls: ScheduleCall[] = [];
-      agent.schedule = async (...args: unknown[]) => {
-        scheduleCalls.push(args);
-      };
-      await seedMessage(agent, message("message-1"));
-      await agent.flushPending();
-      const turnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
-      agent.executeTurn = async () => {
-        state.storage.sql.exec("UPDATE turns SET has_sent = 1 WHERE id = ?", turnId);
-        throw new Error("post-send model failure");
-      };
-
-      await agent.runTurn({ turnId });
-      return {
-        turn: rows<{ status: string; attempt_count: number; has_sent: number }>(
-          state,
-          `SELECT status, attempt_count, has_sent FROM turns WHERE id = '${turnId}'`,
-        )[0],
-        retryCalls: scheduleCalls.filter((call) => call[1] === "retryTurn"),
-      };
-    });
-
-    expect(result.turn).toEqual({ status: "failed", attempt_count: 1, has_sent: 1 });
-    expect(result.retryCalls).toHaveLength(0);
-  });
-
-  it("merges messages received during a running turn into one successor turn", async () => {
-    const result = await withAgent(async (agent, state) => {
-      const scheduleCalls: ScheduleCall[] = [];
-      agent.schedule = async (...args: unknown[]) => {
-        scheduleCalls.push(args);
-      };
-      await seedMessage(agent, message("message-1"));
-      await agent.flushPending();
-      const firstTurnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
-      let executionStarted!: () => void;
-      const started = new Promise<void>((resolve) => { executionStarted = resolve; });
-      let release!: () => void;
-      const blocked = new Promise<void>((resolve) => { release = resolve; });
-      agent.executeTurn = async () => {
-        executionStarted();
-        await blocked;
-        return { hasSent: false };
-      };
-
-      const firstRun = agent.runTurn({ turnId: firstTurnId });
-      await started;
-      await seedMessage(agent, message("message-2"));
-      await seedMessage(agent, message("message-3"));
-      await agent.flushPending();
-      expect(rows<{ id: string }>(state, "SELECT id FROM turns ORDER BY created_at, id")).toHaveLength(1);
-      expect(rows<{ id: string; status: string }>(state, "SELECT id, status FROM messages WHERE status = 'pending' ORDER BY id")).toHaveLength(2);
-
-      release();
-      await firstRun;
-      const turns = rows<{ id: string; status: string }>(state, "SELECT id, status FROM turns ORDER BY created_at, id");
-      const successorId = turns[1]!.id;
-      return {
-        turns,
-        successorMessages: rows<{ message_id: string; position: number }>(
-          state,
-          `SELECT message_id, position FROM turn_messages WHERE turn_id = '${successorId}' ORDER BY position`,
-        ),
-        runCalls: scheduleCalls.filter((call) => call[1] === "runTurn"),
-      };
-    });
-
-    expect(result.turns).toHaveLength(2);
-    expect(result.turns[0]?.status).toBe("completed");
-    expect(result.turns[1]?.status).toBe("queued");
-    expect(result.successorMessages).toEqual([
-      { message_id: 2, position: 0 },
-      { message_id: 3, position: 1 },
-    ]);
-    expect(result.runCalls).toHaveLength(2);
-  });
-
-  it("retains only the newest visible chat rows after completion", async () => {
-    const result = await withAgent(async (agent, state) => {
-      agent.schedule = async () => undefined;
-      agent.getRuntimeConfig = () => ({
-        messageRetentionLimit: 2,
-      }) as never;
-      await seedMessage(agent, message("message-1"));
-      await agent.flushPending();
-      const firstTurnId = rows<{ id: string }>(state, "SELECT id FROM turns LIMIT 1")[0]!.id;
-      state.storage.sql.exec(
-        `INSERT INTO messages
-         (event_id, message_id, direction, chat_kind, chat_id, user_id, text, images_json, status, created_at)
-         VALUES ('old-event', 'old-message', 'inbound', 'group', 'batching-group', 'member-1', 'old', '[]', 'visible', 1),
-                ('new-event', 'new-message', 'outbound', 'group', 'batching-group', NULL, 'new', '[]', 'visible', 2)`,
-      );
-      agent.executeTurn = async () => ({ hasSent: false });
-      await agent.runTurn({ turnId: firstTurnId });
-
-      // Retention is amortized across turns, so drive enough turns to reach
-      // the cleanup interval before asserting the window is bounded.
-      for (let i = 0; i < 10; i += 1) {
-        const turnId = `retention-${i}`;
-        state.storage.sql.exec(
-          `INSERT INTO turns (id, status, attempt_count, first_message_at, created_at)
-           VALUES (?, 'queued', 0, 1, ?)`,
-          turnId,
-          100 + i,
-        );
-        await agent.runTurn({ turnId });
-      }
-
-      return {
-        messages: rows<{ message_id: string; status: string }>(state, "SELECT message_id, status FROM messages WHERE status = 'visible' ORDER BY created_at, id"),
-        totalMessages: rows<{ n: number }>(state, "SELECT COUNT(*) AS n FROM messages")[0]?.n ?? 0,
-      };
-    });
-
-    expect(result.messages).toHaveLength(2);
-    expect(result.messages.map((row) => row.message_id)).toEqual(["new-message", "message-message-1"]);
-    expect(result.totalMessages).toBe(2);
-  });
-
-  it("re-establishes a flush schedule after runTurn scheduling fails", async () => {
-    const result = await withAgent(async (agent, state) => {
-      let callCount = 0;
-      const scheduleCalls: ScheduleCall[] = [];
-      agent.schedule = async (...args: unknown[]) => {
-        callCount += 1;
-        scheduleCalls.push(args);
-        if (callCount === 2) throw new Error("scheduler unavailable");
-        return args;
-      };
-      await seedMessage(agent, message("message-1"));
-      await expect(agent.flushPending()).rejects.toThrow("scheduler unavailable");
-      return {
-        messages: rows<{ status: string; turn_id: string | null }>(state, "SELECT status, turn_id FROM messages"),
-        turns: rows<{ id: string }>(state, "SELECT id FROM turns"),
-        scheduled: await state.storage.get<boolean>("processor_scheduled"),
-        scheduleCalls,
-      };
-    });
-
-    expect(result.messages).toEqual([{ status: "pending", turn_id: null }]);
-    expect(result.turns).toEqual([]);
-    expect(result.scheduled).toBe(true);
-    expect(result.scheduleCalls.at(-1)).toEqual([2, "flushPending", {}]);
-  });
+it('keeps the first pending message deadline when another callback arrives',async()=>{
+ await withAgent(async(agent,state)=>{
+  await agent.receiveMessage(fixtureMessage('first'));
+  const first=(await agent.listSchedules()).find(schedule=>schedule.callback === 'flushPending')!;
+  await agent.receiveMessage(fixtureMessage('second'));
+  const second=(await agent.listSchedules()).find(schedule=>schedule.callback === 'flushPending')!;
+  expect(second.id).toBe(first.id);expect(second.time).toBe(first.time);
+  const created=state.storage.sql.exec<{created_at:number}>('SELECT created_at FROM qq_messages ORDER BY id LIMIT 1').toArray()[0]!.created_at;
+  expect(first.time*1000).toBeGreaterThanOrEqual(created+1000);
+  expect(first.time*1000).toBeLessThanOrEqual(created+2000);
+ });
+});
+it('repairs actual scheduling on event redelivery without inserting another message',async()=>{
+ await withAgent(async(agent,state)=>{
+  const original=agent.schedule.bind(agent);let fail=true;
+  agent.schedule=async(...args)=>{if(fail){fail=false;throw new Error('controlled scheduler failure');}return original(...args);};
+  const message=fixtureMessage('redelivery');
+  await expect(agent.receiveMessage(message)).rejects.toThrow('controlled scheduler failure');
+  expect(await agent.receiveMessage(message)).toEqual({accepted:true,duplicate:true});
+  expect(state.storage.sql.exec('SELECT event_id FROM qq_messages').toArray()).toEqual([{event_id:'event-redelivery'}]);
+  expect((await agent.listSchedules()).filter(schedule=>schedule.callback === 'flushPending')).toHaveLength(1);
+ });
+});
+it('serializes duplicate callbacks and forms a later immutable FIFO batch during model execution',async()=>{
+ await withAgent(async(agent,state)=>{
+  let release!:()=>void,began!:()=>void;
+  const gate=new Promise<void>(resolve=>{release=resolve;}),started=new Promise<void>(resolve=>{began=resolve;});
+  const inputs:string[]=[];
+  agent.createModelClient=()=>({complete:async input=>{inputs.push(JSON.stringify(input.messages));if(inputs.length === 1){began();await gate;}return fixtureCompletion([fixtureCall('send_message',{action:'silent'},String(inputs.length))]);}});
+  await agent.receiveMessage(fixtureMessage('first'));await agent.flushPending();
+  const running=agent.runTurn({turnId:'1'});await started;
+  const duplicate=agent.runTurn({turnId:'1'});
+  await agent.receiveMessage(fixtureMessage('second'));await agent.receiveMessage(fixtureMessage('third'));await agent.flushPending();
+  expect(state.storage.sql.exec('SELECT id,status FROM qq_turns ORDER BY id').toArray()).toEqual([{id:1,status:'active'},{id:2,status:'queued'}]);
+  release();await running;await duplicate;
+  expect(inputs).toHaveLength(2);expect(inputs[0]).not.toContain('second');expect(inputs[1]).toContain('third');
+  expect(state.storage.sql.exec('SELECT event_id,turn_id,batch_position FROM qq_messages ORDER BY id').toArray()).toEqual([{event_id:'event-first',turn_id:1,batch_position:0},{event_id:'event-second',turn_id:2,batch_position:0},{event_id:'event-third',turn_id:2,batch_position:1}]);
+  expect(state.storage.sql.exec('SELECT status FROM qq_turns ORDER BY id').toArray()).toEqual([{status:'completed'},{status:'completed'}]);
+ });
+});
+it('uses persisted 5/30/120-second retries without changing batch membership and advances the next queued turn',async()=>{
+ await withAgent(async(agent,state)=>{
+  let calls=0;
+  agent.createModelClient=()=>({complete:async input=>{calls++;if(input.messages.some(message=>message.role === 'user' && message.content === 'successor'))return fixtureCompletion([fixtureCall('send_message',{action:'silent'})]);throw new Error('controlled provider failure');}});
+  await agent.receiveMessage(fixtureMessage('failing'));await agent.flushPending();
+  await agent.receiveMessage(fixtureMessage('successor'));await agent.flushPending();
+  for(let attempt=1;attempt<=4;attempt++){
+   await agent.runTurn({turnId:'1'});
+   const row=state.storage.sql.exec<{status:string;retry_at:number|null;settled_at:number}>('SELECT t.status,t.retry_at,a.settled_at FROM qq_turns t JOIN qq_attempts a ON a.turn_id=t.id AND a.attempt=t.attempt_count WHERE t.id=1').toArray()[0]!;
+   if(attempt<4){expect(row.status).toBe('retry_wait');expect(row.retry_at!-row.settled_at).toBe([5000,30000,120000][attempt-1]);state.storage.sql.exec('UPDATE qq_turns SET retry_at=? WHERE id=1',Date.now());}
+   else expect(row.status).toBe('failed');
+  }
+  expect(calls).toBe(5);
+  expect(state.storage.sql.exec('SELECT status,attempt_count FROM qq_turns ORDER BY id').toArray()).toEqual([{status:'failed',attempt_count:4},{status:'completed',attempt_count:1}]);
+  expect(state.storage.sql.exec('SELECT event_id,turn_id,batch_position,status FROM qq_messages ORDER BY id').toArray()).toEqual([{event_id:'event-failing',turn_id:1,batch_position:0,status:'failed'},{event_id:'event-successor',turn_id:2,batch_position:0,status:'visible'}]);
+  expect(state.storage.sql.exec('SELECT input_snapshot_json FROM qq_attempts WHERE turn_id=1').toArray()).toEqual(Array.from({length:4},()=>({input_snapshot_json:null})));
+ });
+});
+it('converges a committed delivery without generating another answer',async()=>{
+ await withAgent(async(agent,state)=>{
+  const {attempt}=seedAttempt(state.storage);let calls=0;
+  state.storage.sql.exec("INSERT INTO qq_deliveries(turn_id,action,status,tool_task_id,payload_hash,send_attempts,created_at,updated_at) VALUES(1,'send','sent',100,'hash',1,?,?)",Date.now(),Date.now());
+  agent.createModelClient=()=>({complete:async()=>{calls++;return fixtureCompletion();}});
+  await agent.runTurn({turnId:'1'});
+  expect(calls).toBe(0);
+  expect(state.storage.sql.exec('SELECT status,termination FROM qq_turns').toArray()).toEqual([{status:'completed',termination:'sent'}]);
+  expect(state.storage.sql.exec('SELECT input_snapshot_json,deadline_at FROM qq_attempts').toArray()).toEqual([{input_snapshot_json:null,deadline_at:attempt.deadline_at}]);
+ });
+});
+it('amortizes visible retention while preserving event tombstones and Memory',async()=>{
+ await withAgent(async(agent,state)=>{
+  agent.getRuntimeConfig=()=>({...fixtureConfig,contextMessageLimit:2,messageRetentionLimit:5});
+  state.storage.sql.exec("INSERT INTO qq_memories VALUES('saved','group','','persistent',NULL,0,0)");
+  for(let index=1;index<=10;index++){await agent.receiveMessage(fixtureMessage(`chat-${index}`));await agent.flushPending();await agent.runTurn({turnId:String(index)});}
+  expect(state.storage.sql.exec('SELECT text FROM qq_messages ORDER BY id').toArray()).toEqual([6,7,8,9,10].map(index=>({text:`chat-${index}`})));
+  expect(state.storage.sql.exec('SELECT content FROM qq_memories').toArray()).toEqual([{content:'persistent'}]);
+  expect(await agent.receiveMessage(fixtureMessage('chat-1'))).toEqual({accepted:true,duplicate:true});
+  expect((await agent.listSchedules()).filter(schedule=>['flushPending','wakeProcessor'].includes(schedule.callback))).toEqual([]);
+ });
 });

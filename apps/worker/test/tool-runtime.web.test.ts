@@ -1,156 +1,44 @@
-import { ExaSearchClient } from "@mikan-utsushi/web-tools";
-import { describe, expect, it, vi } from "vitest";
-import {
-  MEMORY_TOOL_DEFINITIONS,
-  MemoryToolRuntime,
-  SEND_MESSAGE_TOOL_DEFINITION,
-  WEB_TOOL_DEFINITIONS,
-} from "../src/agents/tool-runtime";
+import { env,reset,runInDurableObject } from 'cloudflare:test';
+import { afterEach,expect,it } from 'vitest';
+import { ExaSearchClient,readWeb } from '@mikan-utsushi/web-tools';
+import { MemoryToolRuntime } from '../src/agents/tool-runtime';
+import { seedAttempt,fixtureCall } from './runtime-fixtures';
 
-const context = () => ({
-  turnId: "turn-web",
-  speakerId: "member-a",
-  signal: new AbortController().signal,
+afterEach(async()=>{await reset();});
+it('cancels an active Exa HTTP request with the attempt and exposes no credential in the result',async()=>{
+ const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+ await runInDurableObject(ns.get(ns.idFromName('qq:group:fixture')),async(_instance,state)=>{
+  const {context}=seedAttempt(state.storage),controller=new AbortController();
+  let began!:()=>void;const started=new Promise<void>(resolve=>{began=resolve;});let networkSignal:AbortSignal|null|undefined;
+  const runtime=new MemoryToolRuntime(state.storage.sql,{exaClient:new ExaSearchClient({apiKey:'synthetic-private-exa-key',fetchFn:async(_input,init)=>{
+   networkSignal=init?.signal;began();await new Promise<void>((_resolve,reject)=>{networkSignal!.addEventListener('abort',()=>reject(networkSignal!.reason),{once:true});});return Response.json({results:[]});
+  }})});
+  const running=runtime.execute(fixtureCall('search_web',{query:'current'}),{...context,signal:controller.signal});
+  await started;controller.abort(new DOMException('Attempt cancelled','AbortError'));
+  const result=await running;
+  expect(networkSignal!.aborted).toBe(true);
+  expect(JSON.parse(result.content)).toHaveProperty('error');
+  expect(result.content).not.toContain('synthetic-private-exa-key');
+ });
 });
-
-function call(name: string, argumentsValue: Record<string, unknown>) {
-  return {
-    id: `call-${name}`,
-    type: "function" as const,
-    function: { name, arguments: JSON.stringify(argumentsValue) },
-  };
-}
-
-describe("web tool runtime registration", () => {
-  it("exposes memory, web, and send tools", () => {
-    expect([
-      ...MEMORY_TOOL_DEFINITIONS,
-      ...WEB_TOOL_DEFINITIONS,
-      SEND_MESSAGE_TOOL_DEFINITION,
-    ].map((tool) => tool.function.name)).toEqual([
-      "memory_search",
-      "memory_write",
-      "memory_update",
-      "memory_delete",
-      "conversation_search",
-      "search_web",
-      "read_web",
-      "send_message",
-    ]);
-  });
-
-  it("dispatches search_web with the turn abort signal", async () => {
-    let receivedSignal: AbortSignal | undefined;
-    const client = new ExaSearchClient({
-      apiKey: "test-key",
-      fetchFn: async (_input, init) => {
-        receivedSignal = init?.signal;
-        return new Response(JSON.stringify({
-          results: [{ title: "Result", url: "https://example.com", highlights: ["snippet"] }],
-        }), { headers: { "content-type": "application/json" } });
-      },
-    });
-    const runtime = new MemoryToolRuntime({} as SqlStorage, { exaClient: client });
-    const turnContext = context();
-    const result = await runtime.execute(call("search_web", { query: "query" }), turnContext);
-
-    expect(JSON.parse(result.content)).toEqual([
-      { title: "Result", url: "https://example.com", snippet: "snippet" },
-    ]);
-    expect(receivedSignal).toBe(turnContext.signal);
-  });
-
-  it("passes the turn abort signal to send_message", async () => {
-    const sendText = vi.fn(async () => ({ outcome: "failed" as const, status: 429 }));
-    const runtime = new MemoryToolRuntime({
-      exec: (() => ({ toArray: () => [], rowsWritten: 0 })) as unknown as SqlStorage["exec"],
-    } as SqlStorage, { qqClient: { sendText } });
-    const turnContext = { ...context(), chatKind: "group" as const, chatId: "group-1" };
-
-    await runtime.execute(call("send_message", { action: "send", content: "reply" }), turnContext);
-    expect(sendText).toHaveBeenCalledWith(
-      { scope: "group", targetId: "group-1" },
-      "reply",
-      turnContext.signal,
-    );
-  });
-
-  it("bridges a legacy content-only send_message call to an explicit send", async () => {
-    const sendText = vi.fn(async () => ({ outcome: "failed" as const, status: 429 }));
-    const runtime = new MemoryToolRuntime({
-      exec: (() => ({ toArray: () => [], rowsWritten: 0 })) as unknown as SqlStorage["exec"],
-    } as SqlStorage, { qqClient: { sendText } });
-    const turnContext = { ...context(), chatKind: "group" as const, chatId: "group-legacy" };
-
-    const result = await runtime.execute(call("send_message", { content: "legacy reply" }), turnContext);
-
-    expect(JSON.parse(result.content)).toEqual({ outcome: "failed", status: 429 });
-    expect(result.terminal).toBe(false);
-    expect(result.termination).toBeUndefined();
-    expect(sendText).toHaveBeenCalledWith(
-      { scope: "group", targetId: "group-legacy" },
-      "legacy reply",
-      turnContext.signal,
-    );
-  });
-
-  it("returns a terminal silent result without requiring QQ delivery", async () => {
-    const sendText = vi.fn();
-    const runtime = new MemoryToolRuntime({} as SqlStorage, { qqClient: { sendText } });
-
-    const result = await runtime.execute(call("send_message", { action: "silent" }), context());
-
-    expect(JSON.parse(result.content)).toEqual({ outcome: "silent" });
-    expect(result).toMatchObject({ sentCount: 0, terminal: true, termination: "silent" });
-    expect(sendText).not.toHaveBeenCalled();
-  });
-
-  it("rejects an invalid action without treating it as a terminal result", async () => {
-    const sendText = vi.fn();
-    const runtime = new MemoryToolRuntime({} as SqlStorage, { qqClient: { sendText } });
-
-    const result = await runtime.execute(call("send_message", { action: "later", content: "reply" }), {
-      ...context(),
-      chatKind: "group",
-      chatId: "group-invalid-action",
-    });
-
-    expect(JSON.parse(result.content)).toEqual({ error: "action must be send or silent" });
-    expect(result.terminal).toBeUndefined();
-    expect(sendText).not.toHaveBeenCalled();
-  });
-
-  it("keeps a content-less call invalid when the legacy action is absent", async () => {
-    const sendText = vi.fn();
-    const runtime = new MemoryToolRuntime({} as SqlStorage, { qqClient: { sendText } });
-
-    const result = await runtime.execute(call("send_message", {}), {
-      ...context(),
-      chatKind: "group",
-      chatId: "group-missing-content",
-    });
-
-    expect(JSON.parse(result.content)).toEqual({ error: "content must be a non-empty string" });
-    expect(result.terminal).toBeUndefined();
-    expect(sendText).not.toHaveBeenCalled();
-  });
-
-  it("dispatches read_web with the turn abort signal and preserves trust", async () => {
-    const readWebFn = vi.fn(async (_url: string, options?: { signal?: AbortSignal }) => ({
-      url: "https://example.com",
-      contentType: "text/html",
-      text: "untrusted page",
-      truncated: false,
-      trust: "untrusted_web_content" as const,
-    }));
-    const runtime = new MemoryToolRuntime({} as SqlStorage, { readWebFn });
-    const turnContext = context();
-    const result = await runtime.execute(call("read_web", { url: "https://example.com" }), turnContext);
-
-    expect(JSON.parse(result.content)).toMatchObject({
-      text: "untrusted page",
-      trust: "untrusted_web_content",
-    });
-    expect(readWebFn).toHaveBeenCalledWith("https://example.com", { signal: turnContext.signal });
-  });
+it('reads a real restricted-fetch response as untrusted data and rejects a private address before fetching',async()=>{
+ const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+ await runInDurableObject(ns.get(ns.idFromName('qq:group:fixture')),async(_instance,state)=>{
+  const {context}=seedAttempt(state.storage);let requests=0;
+  const runtime=new MemoryToolRuntime(state.storage.sql,{readWebFn:(url,options)=>readWeb(url,{...options,fetchFn:async()=>{requests++;return new Response('public reference',{headers:{'content-type':'text/plain'}});}})});
+  const result=JSON.parse((await runtime.execute(fixtureCall('read_web',{url:'https://example.com/reference'}),context)).content);
+  expect(result).toMatchObject({text:'public reference',trust:'untrusted_web_content'});
+  const blocked=JSON.parse((await runtime.execute(fixtureCall('read_web',{url:'http://127.0.0.1/private'}),context)).content);
+  expect(blocked).toHaveProperty('error');expect(requests).toBe(1);
+ });
+});
+it.each([{action:'later',content:'reply'},{content:'missing action'},{action:'send',content:''}])('rejects an invalid terminal decision before QQ I/O: %j',async args=>{
+ const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+ await runInDurableObject(ns.get(ns.idFromName('qq:group:fixture')),async(_instance,state)=>{
+  const {context}=seedAttempt(state.storage);let requests=0;
+  const runtime=new MemoryToolRuntime(state.storage.sql,{transactionSync:fn=>state.storage.transactionSync(fn),qqClient:{sendText:async()=>{requests++;return {outcome:'sent'};}}});
+  const result=await runtime.execute(fixtureCall('send_message',args),context);
+  expect(JSON.parse(result.content)).toHaveProperty('error');expect(result.terminal).not.toBe(true);expect(requests).toBe(0);
+  expect(state.storage.sql.exec('SELECT status FROM qq_deliveries').toArray()).toEqual([]);
+ });
 });

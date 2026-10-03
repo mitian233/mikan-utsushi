@@ -2,17 +2,17 @@ import { QQBotClient, type QQSendResult } from "@mikan-utsushi/qqbot";
 import type { ModelToolCall, ModelToolDefinition } from "@mikan-utsushi/model-provider";
 import { ExaSearchClient } from "@mikan-utsushi/web-tools";
 import { readWeb, type ReadWebResult } from "@mikan-utsushi/web-tools";
-import type { ToolExecutionContext, ToolExecutionResult, ToolRuntime } from "./turn-runner";
+import type { ToolExecutionContext, ToolExecutionResult, ToolRuntime } from "./runtime-types";
 
 export type MemoryScope = "group" | "user";
 
 type MemoryRow = {
   id: string;
-  scope: string;
+  scope_kind: "group" | "user";
+  owner_id: string;
   content: string;
   created_at: number;
   updated_at: number;
-  last_used_at: number | null;
 };
 
 type ConversationRow = {
@@ -36,15 +36,10 @@ export type SendMessageResult = QQSendResult | { outcome: "silent" };
 export type TerminalSendMessageResult = Exclude<SendMessageResult, { outcome: "failed" }>;
 
 type DeliveryRow = {
-  id: string;
-  turn_id: string;
-  tool_call_id: string;
-  content: string;
-  reply_to_message_id: string | null;
-  status: "planned" | "sent" | "failed" | "outcome_unknown";
+  turn_id: number;
+  status: "planned" | "sent" | "failed" | "outcome_unknown" | "silent";
   platform_message_id: string | null;
-  attempt_count: number;
-  last_error: string | null;
+  error_code: string | null;
 };
 
 export const MEMORY_TOOL_DEFINITIONS: ModelToolDefinition[] = [
@@ -197,7 +192,7 @@ function escapeLike(value: string): string {
 function toMemoryRecord(row: MemoryRow): MemoryRecord {
   return {
     id: row.id,
-    scope: row.scope,
+    scope: row.scope_kind === "group" ? "group" : `user:${row.owner_id}`,
     content: row.content,
     updatedAt: row.updated_at,
   };
@@ -240,21 +235,15 @@ const MAX_AUDIT_FIELD_LENGTH = 1_000;
 const CONVERSATION_SEARCH_DEFAULT_LIMIT = 30;
 const CONVERSATION_SEARCH_MAX_LIMIT = 30;
 
-const AUDIT_TOOL_NAMES = new Set([
-  "memory_search",
-  "memory_write",
-  "memory_update",
-  "memory_delete",
-  "conversation_search",
-  "search_web",
-  "read_web",
-  "send_message",
-]);
+const AUDIT_TOOL_NAMES: Record<string,true> = {
+  memory_search:true, memory_write:true, memory_update:true, memory_delete:true,
+  conversation_search:true, search_web:true, read_web:true, send_message:true,
+};
 
 type AuditShape = Record<string, unknown>;
 
 export function sanitizeAuditToolName(name: string): string {
-  return AUDIT_TOOL_NAMES.has(name) ? name : "unknown";
+  return Object.hasOwn(AUDIT_TOOL_NAMES,name) ? name : "unknown";
 }
 
 export async function hashAuditIdentifier(value: string): Promise<string> {
@@ -387,394 +376,182 @@ export class MemoryToolRuntime implements ToolRuntime {
   private readonly readWebFn: typeof readWeb;
   private readonly qqClient?: Pick<QQBotClient, "sendText">;
   private readonly transactionSync?: <T>(closure: () => T) => T;
+  private readonly sending = new Set<string>();
 
-  constructor(
-    private readonly sql: SqlStorage,
-    options: WebToolRuntimeOptions = {},
-  ) {
+  constructor(private readonly sql: SqlStorage, options: WebToolRuntimeOptions = {}) {
     this.exaClient = options.exaClient ?? (options.exaApiKey ? new ExaSearchClient({ apiKey: options.exaApiKey }) : undefined);
     this.readWebFn = options.readWebFn ?? readWeb;
     this.qqClient = options.qqClient;
     this.transactionSync = options.transactionSync;
   }
 
+  private transaction<T>(fn: () => T): T {
+    if (!this.transactionSync) throw new Error("Atomic tool storage is unavailable");
+    return this.transactionSync(fn);
+  }
+
+  private assertActive(context: ToolExecutionContext): void {
+    context.signal.throwIfAborted();
+    if (Date.now() >= context.deadlineAt) throw new Error("Attempt deadline exceeded");
+    const row = this.sql.exec<{deadline_at:number; speaker_id:string|null; reply_to_message_id:string|null; quote_reference_id:string|null}>(
+      `SELECT a.deadline_at,a.speaker_id,a.reply_to_message_id,a.quote_reference_id FROM qq_attempts a
+       JOIN qq_turns t ON t.id=a.turn_id WHERE a.turn_id=? AND a.attempt=? AND t.status='active'
+       AND t.attempt_count=a.attempt AND a.settled_at IS NULL`, context.turnId, context.attempt).toArray()[0];
+    if (!row || row.deadline_at !== context.deadlineAt || row.speaker_id !== (context.speakerId ?? null)
+      || row.reply_to_message_id !== (context.requiredReplyToMessageId ?? null)
+      || row.quote_reference_id !== (context.requiredQuoteReferenceId ?? null)) throw new Error("Inactive or inconsistent attempt");
+    const identity = this.sql.exec<{chat_kind:string;chat_id:string}>("SELECT chat_kind,chat_id FROM qq_identity WHERE singleton=1").toArray()[0];
+    if (!identity || identity.chat_kind !== context.chatKind || identity.chat_id !== context.chatId) throw new Error("Conversation identity mismatch");
+    if (!Number.isSafeInteger(context.toolTaskId) || context.toolTaskId <= 0) throw new Error("Invalid tool task identity");
+  }
+
   async execute(call: ModelToolCall, context: ToolExecutionContext): Promise<ToolExecutionResult> {
     try {
+      this.assertActive(context);
       const args = parseArguments(call);
-      const result = await this.executeToolCall(call.function.name, args, context, call.id);
-      const terminalResult = call.function.name === "send_message" && isTerminalSendMessageResult(result)
-        ? result
-        : undefined;
-      const sentCount = terminalResult?.outcome === "sent" || terminalResult?.outcome === "unknown" ? 1 : 0;
-      const termination = terminalResult
-        ? (terminalResult.outcome === "silent" ? "silent" : "sent")
-        : undefined;
-      return {
-        content: JSON.stringify(result),
-        sentCount,
-        terminal: terminalResult !== undefined,
-        termination,
-      };
+      const name = call.function.name;
+      let result: unknown;
+      if (name === "memory_write" || name === "memory_update" || name === "memory_delete") {
+        const hash = await hashAuditIdentifier(JSON.stringify({name,args,speakerId:context.speakerId ?? null}));
+        result = this.transaction(() => {
+          this.assertActive(context);
+          const receipt = this.sql.exec<{turn_id:number;attempt:number;tool_name:string;args_hash:string;result_json:string|null}>(
+            "SELECT turn_id,attempt,tool_name,args_hash,result_json FROM qq_effect_receipts WHERE tool_task_id=?",context.toolTaskId).toArray()[0];
+          if (receipt) {
+            if (receipt.turn_id !== Number(context.turnId) || receipt.attempt !== context.attempt || receipt.tool_name !== name || receipt.args_hash !== hash || receipt.result_json === null) throw new Error("Inconsistent or retired effect receipt");
+            return JSON.parse(receipt.result_json);
+          }
+          let value: unknown;
+          try { value = this.mutateMemory(name,args,context); }
+          catch (error) { value = {error:error instanceof Error ? error.message : "Memory operation failed"}; }
+          this.sql.exec(`INSERT INTO qq_effect_receipts(tool_task_id,turn_id,attempt,tool_name,args_hash,outcome,result_json,created_at)
+            VALUES(?,?,?,?,?,?,?,?)`,context.toolTaskId,context.turnId,context.attempt,name,hash,
+            typeof value === "object" && value !== null && "error" in value ? "failed" : "completed",JSON.stringify(value),Date.now());
+          return value;
+        });
+      } else if (name === "send_message") result = await this.sendMessage(args,context);
+      else if (name === "memory_search") result = this.search(args,context);
+      else if (name === "conversation_search") result = this.searchConversation(args);
+      else if (name === "search_web") {
+        if (!this.exaClient) throw new Error("search_web is unavailable");
+        result = await this.exaClient.search(requiredString(args,"query"),context.signal);
+      } else if (name === "read_web") result = await this.readWebFn(requiredString(args,"url"),{signal:context.signal});
+      else result = {error:"Unknown tool"};
+      const terminal = name === "send_message" && isTerminalSendMessageResult(result) ? result : undefined;
+      return {content:JSON.stringify(result),
+        terminal:terminal !== undefined,termination:terminal ? terminal.outcome === "silent" ? "silent" : "sent" : undefined};
     } catch (error) {
-      return {
-        content: JSON.stringify({ error: error instanceof Error ? error.message : String(error) }),
-        sentCount: 0,
-      };
+      return {content:JSON.stringify({error:error instanceof Error ? error.message : "Tool operation failed"})};
     }
   }
 
-  private async executeToolCall(
-    name: string,
-    args: Record<string, unknown>,
-    context: ToolExecutionContext,
-    toolCallId: string,
-  ): Promise<unknown> {
-    switch (name) {
-      case "memory_search":
-        return this.search(args, context);
-      case "memory_write":
-        return this.write(args, context);
-      case "memory_update":
-        return this.update(args, context);
-      case "memory_delete":
-        return this.remove(args, context);
-      case "conversation_search":
-        return this.searchConversation(args);
-      case "search_web":
-        return this.searchWeb(args, context);
-      case "read_web":
-        return this.readWeb(args, context);
-      case "send_message":
-        return this.sendMessage(args, context, toolCallId);
-      default:
-        return { error: "Unknown tool", name };
-    }
+  private delivery(context: ToolExecutionContext): DeliveryRow | undefined {
+    return this.sql.exec<DeliveryRow>("SELECT turn_id,status,platform_message_id,error_code FROM qq_deliveries WHERE turn_id=?",context.turnId).toArray()[0];
   }
 
-  private async searchWeb(args: Record<string, unknown>, context: ToolExecutionContext) {
-    const query = requiredString(args, "query");
-    if (!this.exaClient) throw new Error("search_web is unavailable");
-    return this.exaClient.search(query, context.signal);
-  }
-
-  private async readWeb(args: Record<string, unknown>, context: ToolExecutionContext): Promise<ReadWebResult> {
-    const url = requiredString(args, "url");
-    return this.readWebFn(url, { signal: context.signal });
-  }
-
-  private async sendMessage(args: Record<string, unknown>, context: ToolExecutionContext, toolCallId: string): Promise<SendMessageResult> {
-    const action = args.action === undefined ? "send" : requiredString(args, "action");
+  private async sendMessage(args: Record<string,unknown>, context: ToolExecutionContext): Promise<SendMessageResult> {
+    const action = requiredString(args,"action");
     if (action !== "send" && action !== "silent") throw new Error("action must be send or silent");
-    if (action === "silent") return { outcome: "silent" };
-    if (!this.qqClient) throw new Error("send_message is unavailable");
-    if (!context.chatKind || !context.chatId) throw new Error("Current QQ conversation is unavailable");
-    const content = requiredString(args, "content");
-    // Reply binding is an Agent/platform concern, not a model decision. For
-    // group turns this is the triggering QQ message ID (d.id as msg_id).
-    const replyTo = context.requiredReplyToMessageId;
-    const quoteTo = context.requiredQuoteReferenceId;
-
-    const existing = this.sql.exec<DeliveryRow>(
-      `SELECT id, turn_id, tool_call_id, content, reply_to_message_id, status,
-              platform_message_id, attempt_count, last_error
-       FROM outbound_deliveries WHERE turn_id = ? AND tool_call_id = ?`,
-      context.turnId,
-      toolCallId,
-    ).toArray()[0];
-    if (existing && existing.status === "sent") {
-      this.reconcileSentDelivery(existing, context);
-      return { outcome: "sent", ...(existing.platform_message_id ? { messageId: existing.platform_message_id } : {}) };
+    const existing = this.delivery(context);
+    if (existing?.status === "sent") return {outcome:"sent",...(existing.platform_message_id ? {messageId:existing.platform_message_id} : {})};
+    if (existing?.status === "silent") return {outcome:"silent"};
+    if (existing?.status === "outcome_unknown") return {outcome:"unknown",reason:existing.error_code === "timeout" ? "timeout" : "transport"};
+    if (existing?.status === "planned") {
+      if (this.sending.has(context.turnId)) throw new Error("QQ delivery is already in flight");
+      this.transaction(() => this.sql.exec("UPDATE qq_deliveries SET status='outcome_unknown',error_code='planned_recovery',content=NULL,updated_at=? WHERE turn_id=? AND status='planned'",Date.now(),context.turnId));
+      return {outcome:"unknown",reason:"transport"};
     }
-    if (existing && existing.status === "outcome_unknown") {
-      return { outcome: "unknown", reason: existing.last_error === "timeout" ? "timeout" : "transport" };
-    }
-    if (existing && existing.status === "planned") {
-      // A restart may have happened after the durable plan and before the
-      // network call. Atomically convert the ambiguous plan into a durable
-      // unknown barrier so turn retry cannot replay it.
-      if (!this.transactionSync) throw new Error("transactionSync is required for planned QQ delivery recovery");
-      this.transactionSync(() => {
-        this.sql.exec(
-          `UPDATE outbound_deliveries
-           SET status = 'outcome_unknown', last_error = 'planned_recovery', updated_at = ?
-           WHERE id = ? AND status = 'planned'`,
-          Date.now(),
-          existing.id,
-        );
-        this.sql.exec("UPDATE turns SET has_sent = 1 WHERE id = ?", context.turnId);
+    if (action === "silent") {
+      this.transaction(() => {
+        this.assertActive(context);
+        this.sql.exec(`INSERT INTO qq_deliveries(turn_id,action,status,tool_task_id,created_at,updated_at) VALUES(?,'silent','silent',?,?,?)
+          ON CONFLICT(turn_id) DO UPDATE SET action='silent',status='silent',tool_task_id=excluded.tool_task_id,content=NULL,send_attempts=0,error_code=NULL,updated_at=excluded.updated_at`,context.turnId,context.toolTaskId,Date.now(),Date.now());
       });
-      return { outcome: "unknown", reason: "transport" };
+      return {outcome:"silent"};
     }
-
-    const deliveryId = existing?.id ?? crypto.randomUUID();
-    const now = Date.now();
-    this.sql.exec(
-      `INSERT OR IGNORE INTO outbound_deliveries
-       (id, turn_id, tool_call_id, content, reply_to_message_id, status, attempt_count, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'planned', 0, ?, ?)`,
-      deliveryId,
-      context.turnId,
-      toolCallId,
-      content,
-      replyTo ?? null,
-      now,
-      now,
-    );
-    this.sql.exec(
-      `UPDATE outbound_deliveries
-       SET content = ?, reply_to_message_id = ?, status = 'planned', attempt_count = attempt_count + 1,
-           last_error = NULL, updated_at = ?
-       WHERE id = ? AND status IN ('planned', 'failed')`,
-      content,
-      replyTo ?? null,
-      now,
-      deliveryId,
-    );
-
-    const result = await this.qqClient.sendText(
-      {
-        scope: context.chatKind,
-        targetId: context.chatId,
-        ...(replyTo ? { replyTo } : {}),
-        ...(quoteTo ? { quoteTo } : {}),
-      },
-      content,
-      context.signal,
-    );
-    if (result.outcome === "sent") {
-      this.finalizeSentDelivery({
-        ...existing,
-        id: deliveryId,
-        turn_id: context.turnId,
-        tool_call_id: toolCallId,
-        content,
-        reply_to_message_id: replyTo ?? null,
-        status: "sent",
-        platform_message_id: result.messageId ?? null,
-        attempt_count: existing?.attempt_count ?? 1,
-        last_error: null,
-      }, context);
-      return result;
-    }
-    if (result.outcome === "unknown") {
-      this.finalizeUnknownDelivery(deliveryId, context.turnId, result.reason);
-      return result;
-    }
-
-    this.sql.exec(
-      `UPDATE outbound_deliveries
-       SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?`,
-      `status:${result.status}`,
-      Date.now(),
-      deliveryId,
-    );
-    return result;
-  }
-
-  private finalizeUnknownDelivery(deliveryId: string, turnId: string, reason: "timeout" | "transport"): void {
-    if (!this.transactionSync) throw new Error("transactionSync is required for unknown QQ delivery outcomes");
-    this.transactionSync(() => {
-      this.sql.exec(
-        `UPDATE outbound_deliveries
-         SET status = 'outcome_unknown', last_error = ?, updated_at = ? WHERE id = ?`,
-        reason,
-        Date.now(),
-        deliveryId,
-      );
-      this.sql.exec("UPDATE turns SET has_sent = 1 WHERE id = ?", turnId);
+    if (!this.qqClient) throw new Error("send_message is unavailable");
+    const content = requiredString(args,"content");
+    const payloadHash = await hashAuditIdentifier(JSON.stringify({content,replyTo:context.requiredReplyToMessageId ?? null,quoteTo:context.requiredQuoteReferenceId ?? null}));
+    this.transaction(() => {
+      this.assertActive(context);
+      const current = this.delivery(context);
+      if (current && current.status !== "failed") throw new Error("QQ delivery barrier already exists");
+      this.sql.exec(`INSERT INTO qq_deliveries(turn_id,action,status,tool_task_id,payload_hash,content,reply_to_message_id,quote_reference_id,send_attempts,created_at,updated_at)
+        VALUES(?,'send','planned',?,?,?,?,?,1,?,?) ON CONFLICT(turn_id) DO UPDATE SET action='send',status='planned',tool_task_id=excluded.tool_task_id,
+        payload_hash=excluded.payload_hash,content=excluded.content,reply_to_message_id=excluded.reply_to_message_id,quote_reference_id=excluded.quote_reference_id,
+        send_attempts=qq_deliveries.send_attempts+1,error_code=NULL,updated_at=excluded.updated_at`,context.turnId,context.toolTaskId,payloadHash,content,
+        context.requiredReplyToMessageId ?? null,context.requiredQuoteReferenceId ?? null,Date.now(),Date.now());
+      this.sending.add(context.turnId);
     });
+    try {
+      let result: QQSendResult;
+      try { result = await this.qqClient.sendText({scope:context.chatKind!,targetId:context.chatId!,
+        ...(context.requiredReplyToMessageId ? {replyTo:context.requiredReplyToMessageId} : {}),
+        ...(context.requiredQuoteReferenceId ? {quoteTo:context.requiredQuoteReferenceId} : {})},content,context.signal); }
+      catch { result = {outcome:"unknown",reason:context.signal.aborted ? "timeout" : "transport"}; }
+      this.transaction(() => {
+        const now = Date.now();
+        if (result.outcome === "sent") {
+          this.sql.exec("UPDATE qq_deliveries SET status='sent',platform_message_id=?,content=NULL,error_code=NULL,updated_at=? WHERE turn_id=? AND status='planned'",result.messageId ?? null,now,context.turnId);
+          this.sql.exec(`INSERT OR IGNORE INTO qq_messages(direction,delivery_turn_id,platform_message_id,turn_id,status,text,reply_to_message_id,quote_reference_id,created_at)
+            VALUES('outbound',?,?,?,'visible',?,?,?,?)`,context.turnId,result.messageId ?? `delivery:${context.turnId}`,context.turnId,content,
+            context.requiredReplyToMessageId ?? null,context.requiredQuoteReferenceId ?? null,now);
+        } else this.sql.exec("UPDATE qq_deliveries SET status=?,content=NULL,error_code=?,updated_at=? WHERE turn_id=? AND status='planned'",
+          result.outcome === "unknown" ? "outcome_unknown" : "failed",result.outcome === "unknown" ? result.reason : `status:${result.status}`,now,context.turnId);
+      });
+      return result;
+    } finally { this.sending.delete(context.turnId); }
   }
 
-  private finalizeSentDelivery(delivery: DeliveryRow, context: ToolExecutionContext): void {
-    const finalize = () => {
-      this.sql.exec(
-        `UPDATE outbound_deliveries
-         SET status = 'sent', platform_message_id = ?, updated_at = ? WHERE id = ?`,
-        delivery.platform_message_id,
-        Date.now(),
-        delivery.id,
-      );
-      this.sql.exec("UPDATE turns SET has_sent = 1 WHERE id = ?", context.turnId);
-      this.sql.exec(
-        `INSERT OR IGNORE INTO messages
-         (event_id, message_id, direction, chat_kind, chat_id, user_id, text,
-          images_json, reply_to_message_id, status, created_at, turn_id)
-         VALUES (?, ?, 'outbound', ?, ?, NULL, ?, '[]', ?, 'visible', ?, ?)`,
-        `delivery:${delivery.id}`,
-        delivery.platform_message_id ?? delivery.id,
-        context.chatKind,
-        context.chatId,
-        delivery.content,
-        delivery.reply_to_message_id,
-        Date.now(),
-        context.turnId,
-      );
-    };
-    if (this.transactionSync) this.transactionSync(finalize);
-    else finalize();
+  private scope(args: Record<string,unknown>, context: ToolExecutionContext): [MemoryScope,string] {
+    const scope = optionalScope(args);
+    if (scope === "user" && !context.speakerId) throw new Error("Current user is required for user memory scope");
+    return [scope,scope === "group" ? "" : context.speakerId!];
   }
 
-  private reconcileSentDelivery(delivery: DeliveryRow, context: ToolExecutionContext): void {
-    this.finalizeSentDelivery(delivery, context);
+  private search(args: Record<string,unknown>, context: ToolExecutionContext): MemoryRecord[] {
+    const [scope,owner] = this.scope(args,context);
+    if (args.query !== undefined && typeof args.query !== "string") throw new Error("query must be a string");
+    const query = args.query as string | undefined;
+    return this.sql.exec<MemoryRow>(`SELECT * FROM qq_memories WHERE scope_kind=? AND owner_id=? AND content LIKE ? ESCAPE '\\'
+      ORDER BY updated_at DESC,id DESC LIMIT 20`,scope,owner,`%${escapeLike(query ?? "")}%`).toArray().map(toMemoryRecord);
   }
 
-  private searchConversation(args: Record<string, unknown>): Array<{
-    id: string;
-    direction: "inbound" | "outbound";
-    userId: string | null;
-    username: string | null;
-    text: string;
-    timestamp: number | null;
-    createdAt: number;
-  }> {
-    const query = args.query === undefined
-      ? ""
-      : typeof args.query === "string"
-        ? args.query.trim()
-        : (() => { throw new Error("query must be a string"); })();
-    const before = this.optionalTimestamp(args.before, "before");
-    const after = this.optionalTimestamp(args.after, "after");
-    if (before !== undefined && after !== undefined && before <= after) {
-      throw new Error("before must be greater than after");
+  private mutateMemory(name: string,args: Record<string,unknown>,context: ToolExecutionContext): unknown {
+    const now = Math.max(Date.now(),(this.sql.exec<{value:number|null}>("SELECT MAX(updated_at) AS value FROM qq_memories").toArray()[0]?.value ?? 0)+1);
+    if (name === "memory_write") {
+      const [scope,owner] = this.scope(args,context),content = requiredString(args,"content"),id = crypto.randomUUID();
+      if (args.source_message_id !== undefined && typeof args.source_message_id !== "string") throw new Error("source_message_id must be a string");
+      this.sql.exec("INSERT INTO qq_memories(id,scope_kind,owner_id,content,source_message_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",id,scope,owner,content,args.source_message_id as string ?? null,now,now);
+      return {id,scope:resolveMemoryScope(scope,context.speakerId),content,updatedAt:now};
     }
-    const limit = this.conversationSearchLimit(args.limit);
-    const conditions = ["status = 'visible'", "text IS NOT NULL"];
-    const parameters: Array<string | number> = [];
-    if (query !== "") {
-      conditions.push("text LIKE ? ESCAPE '\\'");
-      parameters.push(`%${escapeLike(query)}%`);
-    }
-    if (before !== undefined) {
-      conditions.push("created_at < ?");
-      parameters.push(before);
-    }
-    if (after !== undefined) {
-      conditions.push("created_at > ?");
-      parameters.push(after);
-    }
-    const rows = this.sql.exec<ConversationRow>(
-      `SELECT id, direction, user_id, username, text, timestamp, created_at
-       FROM messages
-       WHERE ${conditions.join(" AND ")}
-       ORDER BY created_at DESC, id DESC
-       LIMIT ?`,
-      ...parameters,
-      limit,
-    ).toArray();
-    return rows.reverse().map((row) => ({
-      id: String(row.id),
-      direction: row.direction,
-      userId: row.user_id,
-      username: row.username,
-      text: row.text,
-      timestamp: row.timestamp,
-      createdAt: row.created_at,
-    }));
-  }
-
-  private optionalTimestamp(value: unknown, name: string): number | undefined {
-    if (value === undefined) return undefined;
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-      throw new Error(`${name} must be a non-negative safe integer`);
-    }
-    return value;
-  }
-
-  private conversationSearchLimit(value: unknown): number {
-    if (value === undefined) return CONVERSATION_SEARCH_DEFAULT_LIMIT;
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > CONVERSATION_SEARCH_MAX_LIMIT) {
-      throw new Error(`limit must be an integer between 1 and ${CONVERSATION_SEARCH_MAX_LIMIT}`);
-    }
-    return value;
-  }
-
-  private search(args: Record<string, unknown>, context: ToolExecutionContext): MemoryRecord[] {
-    const scope = resolveMemoryScope(optionalScope(args), context.speakerId);
-    const query = args.query === undefined
-      ? ""
-      : typeof args.query === "string"
-        ? args.query
-        : (() => { throw new Error("query must be a string"); })();
-    const rows = query === ""
-      ? this.sql.exec<MemoryRow>(
-          `SELECT id, scope, content, created_at, updated_at, last_used_at
-           FROM memories WHERE scope = ? ORDER BY updated_at DESC, id DESC LIMIT 20`,
-          scope,
-        ).toArray()
-      : this.sql.exec<MemoryRow>(
-          `SELECT id, scope, content, created_at, updated_at, last_used_at
-           FROM memories
-           WHERE scope = ? AND content LIKE ? ESCAPE '\\'
-           ORDER BY updated_at DESC, id DESC LIMIT 20`,
-          scope,
-          `%${escapeLike(query)}%`,
-        ).toArray();
-
-    return rows.map(toMemoryRecord);
-  }
-
-  private write(args: Record<string, unknown>, context: ToolExecutionContext): MemoryRecord {
-    const scope = resolveMemoryScope(optionalScope(args), context.speakerId);
-    const content = requiredString(args, "content");
-    const sourceMessageId = args.source_message_id;
-    if (sourceMessageId !== undefined && typeof sourceMessageId !== "string") {
-      throw new Error("source_message_id must be a string");
-    }
-    const now = Math.max(
-      Date.now(),
-      (this.sql.exec<{ updated_at: number | null }>("SELECT MAX(updated_at) AS updated_at FROM memories").toArray()[0]?.updated_at ?? 0) + 1,
-    );
-    const id = crypto.randomUUID();
-    this.sql.exec(
-      `INSERT INTO memories (id, scope, content, source_message_id, created_at, updated_at, last_used_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL)`,
-      id,
-      scope,
-      content,
-      sourceMessageId ?? null,
-      now,
-      now,
-    );
-    return { id, scope, content, updatedAt: now };
-  }
-
-  private update(args: Record<string, unknown>, context: ToolExecutionContext): MemoryRecord {
-    const id = requiredString(args, "id");
-    const content = requiredString(args, "content");
-    const allowedScopes = this.allowedScopes(context);
-    const now = Date.now();
-    const updated = this.sql.exec(
-      `UPDATE memories SET content = ?, updated_at = ?
-       WHERE id = ? AND scope IN (?, ?)` ,
-      content,
-      now,
-      id,
-      allowedScopes[0],
-      allowedScopes[1],
-    );
-    if (updated.rowsWritten === 0) throw new Error("Memory not found");
-    const row = this.sql.exec<MemoryRow>(
-      "SELECT id, scope, content, created_at, updated_at, last_used_at FROM memories WHERE id = ?",
-      id,
-    ).toArray()[0];
+    const id = requiredString(args,"id");
+    const row = this.sql.exec<MemoryRow>("SELECT * FROM qq_memories WHERE id=? AND (scope_kind='group' OR (scope_kind='user' AND owner_id=?))",id,context.speakerId ?? "").toArray()[0];
     if (!row) throw new Error("Memory not found");
-    return toMemoryRecord(row);
+    if (name === "memory_delete") { this.sql.exec("DELETE FROM qq_memories WHERE id=?",id); return {deleted:true,id}; }
+    const content = requiredString(args,"content");
+    this.sql.exec("UPDATE qq_memories SET content=?,updated_at=? WHERE id=?",content,now,id);
+    return {...toMemoryRecord(row),content,updatedAt:now};
   }
 
-  private remove(args: Record<string, unknown>, context: ToolExecutionContext): { deleted: true; id: string } {
-    const id = requiredString(args, "id");
-    const allowedScopes = this.allowedScopes(context);
-    const deleted = this.sql.exec(
-      "DELETE FROM memories WHERE id = ? AND scope IN (?, ?)",
-      id,
-      allowedScopes[0],
-      allowedScopes[1],
-    );
-    if (deleted.rowsWritten === 0) throw new Error("Memory not found");
-    return { deleted: true, id };
+  private searchConversation(args: Record<string,unknown>): unknown {
+    if (args.query !== undefined && typeof args.query !== "string") throw new Error("query must be a string");
+    const query = (args.query as string | undefined)?.trim() ?? "";
+    const before = this.optionalTimestamp(args.before,"before"), after = this.optionalTimestamp(args.after,"after");
+    if (before !== undefined && after !== undefined && before <= after) throw new Error("before must be greater than after");
+    const limit = args.limit ?? CONVERSATION_SEARCH_DEFAULT_LIMIT;
+    if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || limit > CONVERSATION_SEARCH_MAX_LIMIT) throw new Error("limit must be an integer between 1 and 30");
+    const where = ["status='visible'","text IS NOT NULL"],params: Array<string|number> = [];
+    if (query) { where.push("text LIKE ? ESCAPE '\\'"); params.push(`%${escapeLike(query)}%`); }
+    if (before !== undefined) { where.push("created_at < ?"); params.push(before); }
+    if (after !== undefined) { where.push("created_at > ?"); params.push(after); }
+    return this.sql.exec<ConversationRow>(`SELECT id,direction,user_id,username,text,platform_timestamp AS timestamp,created_at FROM qq_messages WHERE ${where.join(" AND ")} ORDER BY created_at DESC,id DESC LIMIT ?`,...params,limit)
+      .toArray().reverse().map(row=>({id:String(row.id),direction:row.direction,userId:row.user_id,username:row.username,text:row.text,timestamp:row.timestamp,createdAt:row.created_at}));
   }
 
-  private allowedScopes(context: ToolExecutionContext): [string, string] {
-    return ["group", context.speakerId ? `user:${context.speakerId}` : "user:"];
+  private optionalTimestamp(value: unknown,name: string): number | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error(`${name} must be a non-negative safe integer`);
+    return value;
   }
 }

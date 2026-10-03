@@ -1,483 +1,120 @@
-import { env, listDurableObjectIds, reset, runInDurableObject } from "cloudflare:test";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ChatMessage } from "@mikan-utsushi/contracts";
-import worker from "../src/index";
-import { MemoryToolRuntime } from "../src/agents/tool-runtime";
-import type { Env } from "../src/env";
+import { env,listDurableObjectIds,reset,runInDurableObject } from 'cloudflare:test';
+import { afterEach,describe,expect,it,vi } from 'vitest';
+import { OpenAICompatibleClient,type PiCompletionClient } from '@mikan-utsushi/model-provider';
+import { QQBotClient } from '@mikan-utsushi/qqbot';
+import type * as QQBotModule from '@mikan-utsushi/qqbot';
+import worker from '../src/index';
+import type { GroupChatAgent } from '../src/agents/group-chat-agent';
+import { MemoryToolRuntime } from '../src/agents/tool-runtime';
+import type { Env,RuntimeConfig } from '../src/env';
+import { fixtureCall,fixtureCompletion,fixtureConfig,fixtureMessage } from './runtime-fixtures';
 
-vi.mock("@mikan-utsushi/qqbot", async () => {
-  const actual = await vi.importActual<typeof import("@mikan-utsushi/qqbot")>("@mikan-utsushi/qqbot");
-  return {
-    ...actual,
-    verifyQQWebhookSignature: vi.fn(async ({ signature }: { signature: string }) => signature !== "bad"),
-  };
+vi.mock('@mikan-utsushi/qqbot',async()=>{
+ const actual=await vi.importActual<typeof QQBotModule>('@mikan-utsushi/qqbot');
+ return {...actual,verifyQQWebhookSignature:vi.fn(async({signature}:{signature:string})=>signature !== 'bad')};
 });
-
-const TEST_APP_SECRET = "webhook-test-secret";
-const workerEnv = { ...env, QQ_APP_SECRET: TEST_APP_SECRET } as unknown as Env;
-
-type Payload = Record<string, unknown>;
-
-function groupPayload(eventId = "event-group-1"): Payload {
-  return {
-    id: eventId,
-    op: 0,
-    t: "GROUP_AT_MESSAGE_CREATE",
-    d: {
-      id: `message-${eventId}`,
-      group_openid: "group-openid-1",
-      content: "hello",
-      timestamp: "2026-09-15T00:00:00.000Z",
-      author: { member_openid: "member-openid-1", username: "Mikan" },
-      message_scene: {
-        source: "default",
-        ext: [`msg_idx=REFIDX-${eventId}==`, "auth_token=token"],
-      },
-    },
-  };
+const workerEnv={...env,QQ_APP_SECRET:'synthetic-webhook-secret'} as Env;
+type TestAgent=Omit<GroupChatAgent,never>&{getRuntimeConfig():RuntimeConfig;createModelClient(config:RuntimeConfig):PiCompletionClient;createToolRuntime(config?:RuntimeConfig):MemoryToolRuntime};
+type Payload=Record<string,unknown>;
+function groupPayload(eventId='group-event'):Payload {
+ return {id:eventId,op:0,t:'GROUP_AT_MESSAGE_CREATE',d:{id:`message-${eventId}`,group_openid:'group-openid-1',content:'hello',timestamp:'2026-09-15T00:00:00.000Z',author:{member_openid:'member-openid-1',username:'Mikan'},message_scene:{source:'default',ext:[`msg_idx=REFIDX-${eventId}==`,'auth_token=synthetic-token']}}};
 }
-
-function c2cPayload(eventId = "event-c2c-1"): Payload {
-  return {
-    id: eventId,
-    op: 0,
-    t: "C2C_MESSAGE_CREATE",
-    d: {
-      id: `message-${eventId}`,
-      content: "hello c2c",
-      author: { user_openid: "user-openid-1" },
-    },
-  };
+function c2cPayload(eventId='c2c-event'):Payload {
+ return {id:eventId,op:0,t:'C2C_MESSAGE_CREATE',d:{id:`message-${eventId}`,content:'hello c2c',author:{user_openid:'user-openid-1'}}};
 }
-
-function normalizedGroupMessage(eventId: string): ChatMessage {
-  return {
-    platform: "qq",
-    eventId,
-    messageId: `message-${eventId}`,
-    chatId: "schedule-retry-group",
-    chatKind: "group",
-    userId: "schedule-retry-member",
-    username: "Mikan",
-    text: "hello",
-    images: [],
-    timestamp: Date.parse("2026-09-15T00:00:00.000Z"),
-  };
+function sendWebhook(payload:Payload,options:{signature?:string;env?:Env}={}) {
+ return worker.fetch(new Request('https://worker.test/webhooks/qq',{method:'POST',headers:{'content-type':'application/json','x-signature-timestamp':'1726358400','x-signature-ed25519':options.signature ?? 'valid'},body:JSON.stringify(payload)}),options.env ?? workerEnv);
 }
+function stub(name:string){const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;return ns.get(ns.idFromName(name));}
+function storedRows(name:string){return runInDurableObject(stub(name),(_instance,state)=>state.storage.sql.exec('SELECT m.event_id,i.chat_id,i.chat_kind,m.status FROM qq_messages m JOIN qq_identity i ON i.singleton=1 ORDER BY m.id').toArray());}
+afterEach(async()=>{await reset();});
 
-async function sendWebhook(payload: Payload, options: { signature?: string; env?: Env } = {}): Promise<Response> {
-  const headers = new Headers({
-    "content-type": "application/json",
-    "x-signature-timestamp": "1726358400",
-    "x-signature-ed25519": options.signature ?? "valid",
+describe('QQ webhook integration',()=>{
+ it('requires the admin secret for manual retries',async()=>{
+  const response=await worker.fetch(new Request('https://worker.test/admin/retry-turn',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agentName:'qq:group:fixture',turnId:'1'})}),{...workerEnv,ADMIN_RETRY_SECRET:'synthetic-admin-secret'});
+  expect(response.status).toBe(401);
+ });
+ it('executes an eligible persisted retry after an authorized admin request',async()=>{
+  let requests=0;
+  await runInDurableObject(stub('qq:group:fixture'),async(instance,state)=>{
+   const agent=instance as TestAgent;
+   agent.schedule=async()=>({id:'controlled'} as never);agent.getRuntimeConfig=()=>fixtureConfig;
+   agent.createModelClient=()=>({complete:async()=>{requests++;if(requests === 1)throw new Error('controlled failure');return fixtureCompletion([fixtureCall('send_message',{action:'silent'})]);}});
+   await agent.receiveMessage(fixtureMessage('admin'));await agent.flushPending();await agent.runTurn({turnId:'1'});
+   expect(state.storage.sql.exec('SELECT status FROM qq_turns').toArray()).toEqual([{status:'retry_wait'}]);
+   state.storage.sql.exec('UPDATE qq_turns SET retry_at=? WHERE id=1',Date.now());
   });
-  return worker.fetch(
-    new Request("https://worker.test/webhooks/qq", {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    }),
-    options.env ?? workerEnv,
-  );
-}
-
-async function storedRows(name: string): Promise<Array<Record<string, unknown>>> {
-  const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-  const stub = namespace.get(namespace.idFromName(name));
-  return runInDurableObject(stub, (_agent, state) =>
-    state.storage.sql.exec("SELECT event_id, chat_id, chat_kind, status FROM messages ORDER BY id").toArray(),
-  );
-}
-
-afterEach(async () => {
-  await reset();
-});
-
-describe("QQ webhook integration", () => {
-  it("requires the admin secret for manual turn retries", async () => {
-    const response = await worker.fetch(
-      new Request("https://worker.test/admin/retry-turn", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ agentName: "qq:group:admin-retry-group", turnId: "turn-1" }),
-      }),
-      { ...workerEnv, ADMIN_RETRY_SECRET: "admin-secret" },
-    );
-
-    expect(response.status).toBe(401);
+  const response=await worker.fetch(new Request('https://worker.test/admin/retry-turn',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer synthetic-admin-secret'},body:JSON.stringify({agentName:'qq:group:fixture',turnId:'1'})}),{...workerEnv,ADMIN_RETRY_SECRET:'synthetic-admin-secret'});
+  expect(response.status).toBe(200);expect(requests).toBe(2);
+  expect(await runInDurableObject(stub('qq:group:fixture'),(_instance,state)=>state.storage.sql.exec('SELECT status,attempt_count,termination FROM qq_turns').toArray())).toEqual([{status:'completed',attempt_count:2,termination:'silent'}]);
+ });
+ it('persists a supported callback once and ACKs duplicate events',async()=>{
+  expect((await sendWebhook(groupPayload())).status).toBe(200);expect((await sendWebhook(groupPayload())).status).toBe(200);
+  expect(await storedRows('qq:group:group-openid-1')).toEqual([{event_id:'group-event',chat_id:'group-openid-1',chat_kind:'group',status:'pending'}]);
+ });
+ it('requires a group reply only when the bot is mentioned',async()=>{
+  const without={...groupPayload('without'),t:'GROUP_MESSAGE_CREATE'},withMention={...groupPayload('mention'),t:'GROUP_MESSAGE_CREATE',d:{...groupPayload('mention').d as Record<string,unknown>,mentions:[{id:'bot',is_you:true,bot:true}]}};
+  expect((await sendWebhook(without)).status).toBe(200);expect((await sendWebhook(withMention)).status).toBe(200);
+  expect(await runInDurableObject(stub('qq:group:group-openid-1'),(_instance,state)=>state.storage.sql.exec('SELECT event_id,platform_message_id,reply_required FROM qq_messages ORDER BY id').toArray())).toEqual([{event_id:'without',platform_message_id:'message-without',reply_required:0},{event_id:'mention',platform_message_id:'message-mention',reply_required:1}]);
+ });
+ it.each(['group','c2c'] as const)('runs a webhook-created %s message through Pi and one QQ HTTP delivery',async kind=>{
+  const eventId=`e2e-${kind}`,name=kind === 'group' ? 'qq:group:group-openid-1' : 'qq:c2c:user-openid-1',payload=kind === 'group' ? groupPayload(eventId) : c2cPayload(eventId);
+  expect((await sendWebhook(payload)).status).toBe(200);
+  const observed=await runInDurableObject(stub(name),async(instance,state)=>{
+   const agent=instance as TestAgent,requests:Array<{url:string;body:Record<string,unknown>}>=[];let completions=0;
+   agent.getRuntimeConfig=()=>fixtureConfig;
+   agent.createModelClient=()=>new OpenAICompatibleClient({url:fixtureConfig.llmUrl,apiKey:'synthetic-key',model:'fixture',fetchFn:async()=>{
+    completions++;return Response.json({choices:[{message:{role:'assistant',content:null,tool_calls:[{id:'send-call',type:'function',function:{name:'send_message',arguments:JSON.stringify({action:'send',content:'webhook reply'})}}]}}]});
+   }});
+   const qq=new QQBotClient({appId:'synthetic-app',appSecret:'synthetic-secret',apiBase:'https://qq.fixture.test',tokenUrl:'https://token.fixture.test',fetchFn:async(url,init)=>{
+    requests.push({url:String(url),body:JSON.parse(String(init?.body))});return String(url).includes('token.') ? Response.json({access_token:'synthetic-access-token',expires_in:7200}) : Response.json({id:'confirmed-message'});
+   }});
+   agent.createToolRuntime=()=>new MemoryToolRuntime(state.storage.sql,{qqClient:qq,transactionSync:fn=>state.storage.transactionSync(fn)});
+   await agent.flushPending();await agent.runTurn({turnId:'1'});
+   return {requests,completions,deliveries:state.storage.sql.exec('SELECT status,platform_message_id FROM qq_deliveries').toArray(),messages:state.storage.sql.exec('SELECT direction,status,text FROM qq_messages ORDER BY id').toArray(),schedules:await agent.listSchedules()};
   });
-
-  it("invokes retryTurn for an authorized admin request", async () => {
-    const response = await worker.fetch(
-      new Request("https://worker.test/admin/retry-turn", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: "Bearer admin-secret",
-        },
-        body: JSON.stringify({ agentName: "qq:group:admin-retry-group", turnId: "turn-1" }),
-      }),
-      { ...workerEnv, ADMIN_RETRY_SECRET: "admin-secret" },
-    );
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ ok: true, turnId: "turn-1" });
+  expect(observed.completions).toBe(1);expect(observed.requests).toHaveLength(2);
+  const send=observed.requests[1]!;
+  expect(send.url).toBe(kind === 'group' ? 'https://qq.fixture.test/v2/groups/group-openid-1/messages' : 'https://qq.fixture.test/v2/users/user-openid-1/messages');
+  expect(send.body).toMatchObject({content:'webhook reply'});
+  if(kind === 'group')expect(send.body).toMatchObject({msg_id:'message-e2e-group',message_reference:{message_id:'REFIDX-e2e-group=='}});
+  expect(observed.deliveries).toEqual([{status:'sent',platform_message_id:'confirmed-message'}]);
+  expect(observed.messages).toEqual([{direction:'inbound',status:'visible',text:kind === 'group' ? 'hello' : 'hello c2c'},{direction:'outbound',status:'visible',text:'webhook reply'}]);
+  expect(observed.schedules.filter(schedule=>['flushPending','wakeProcessor'].includes(schedule.callback))).toEqual([]);
+  expect((await sendWebhook(payload)).status).toBe(200);
+  expect(await runInDurableObject(stub(name),(_instance,state)=>state.storage.sql.exec('SELECT send_attempts,status FROM qq_deliveries').toArray())).toEqual([{send_attempts:1,status:'sent'}]);
+ });
+ it('isolates group and C2C conversation identities',async()=>{
+  expect((await sendWebhook(groupPayload())).status).toBe(200);expect((await sendWebhook(c2cPayload())).status).toBe(200);
+  expect(await storedRows('qq:group:group-openid-1')).toEqual([{event_id:'group-event',chat_id:'group-openid-1',chat_kind:'group',status:'pending'}]);
+  expect(await storedRows('qq:c2c:user-openid-1')).toEqual([{event_id:'c2c-event',chat_id:'user-openid-1',chat_kind:'c2c',status:'pending'}]);
+ });
+ it('rejects missing and invalid signatures',async()=>{
+  expect((await worker.fetch(new Request('https://worker.test/webhooks/qq',{method:'POST',body:JSON.stringify(groupPayload())}),workerEnv)).status).toBe(401);
+  expect((await sendWebhook(groupPayload(),{signature:'bad'})).status).toBe(401);
+ });
+ it('ACKs unsupported events without creating an Agent',async()=>{
+  const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace,before=(await listDurableObjectIds(ns)).map(id=>id.toString()).sort();
+  const response=await sendWebhook({id:'ready',op:0,t:'READY',d:{}});
+  expect(response.status).toBe(200);expect(await response.json()).toEqual({op:12,d:0});expect((await listDurableObjectIds(ns)).map(id=>id.toString()).sort()).toEqual(before);
+ });
+ it.each(['','{',JSON.stringify({op:0,t:'MESSAGE_CREATE',d:null}),JSON.stringify({op:0,t:'MESSAGE_CREATE',d:[]})])('rejects an invalid payload: %s',async body=>{
+  expect((await worker.fetch(new Request('https://worker.test/webhooks/qq',{method:'POST',headers:{'content-type':'application/json'},body}),workerEnv)).status).toBe(400);
+ });
+ it('withholds ACK on scheduling failure and repairs the persisted event on redelivery',async()=>{
+  const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+  await runInDurableObject(stub('qq:group:group-openid-1'),async(instance)=>{
+   const agent=instance as TestAgent;await agent.lifecycle.start();const original=agent.schedule.bind(agent);let calls=0;
+   agent.schedule=async(...args)=>{if(++calls === 1)throw new Error('scheduler unavailable');return original(...args);};
   });
-
-  it("persists a supported message once and ACKs duplicate events", async () => {
-    expect((await sendWebhook(groupPayload())).status).toBe(200);
-    expect((await sendWebhook(groupPayload())).status).toBe(200);
-
-    const rows = await storedRows("qq:group:group-openid-1");
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({
-      event_id: "event-group-1",
-      chat_id: "group-openid-1",
-      chat_kind: "group",
-      status: "pending",
-    });
-  });
-
-  it("persists GROUP_MESSAGE_CREATE as reply-required only when the bot is mentioned", async () => {
-    const withoutMention = {
-      ...groupPayload("event-group-message-create"),
-      t: "GROUP_MESSAGE_CREATE",
-    };
-    const withMention = {
-      ...groupPayload("event-group-bot-mention"),
-      t: "GROUP_MESSAGE_CREATE",
-      d: {
-        ...groupPayload("event-group-bot-mention").d as Record<string, unknown>,
-        mentions: [{ id: "bot-openid-1", is_you: true, bot: true }],
-      },
-    };
-    expect((await sendWebhook(withoutMention)).status).toBe(200);
-    expect((await sendWebhook(withMention)).status).toBe(200);
-
-    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-    const stub = namespace.get(namespace.idFromName("qq:group:group-openid-1"));
-    const rows = await runInDurableObject(stub, (_agent, state) =>
-      state.storage.sql.exec("SELECT event_id, message_id, reply_required FROM messages ORDER BY id").toArray(),
-    );
-    expect(rows).toEqual([
-      {
-        event_id: "event-group-message-create",
-        message_id: "message-event-group-message-create",
-        reply_required: 0,
-      },
-      {
-        event_id: "event-group-bot-mention",
-        message_id: "message-event-group-bot-mention",
-        reply_required: 1,
-      },
-    ]);
-  });
-
-  it("runs a webhook-created group message through batching and one durable delivery", async () => {
-    expect((await sendWebhook(groupPayload("e2e-group-event"))).status).toBe(200);
-    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-    const stub = namespace.get(namespace.idFromName("qq:group:group-openid-1"));
-    const observed = await runInDurableObject(stub, async (instance, state) => {
-      const agent = instance as unknown as {
-        schedule(...args: unknown[]): Promise<unknown>;
-        flushPending(): Promise<void>;
-        runTurn(payload: { turnId: string }): Promise<void>;
-        getRuntimeConfig(): Record<string, unknown>;
-        createModelClient(config: unknown): unknown;
-        createToolRuntime(config?: unknown): MemoryToolRuntime;
-      };
-      agent.schedule = async () => undefined;
-      agent.getRuntimeConfig = () => ({
-        qqAppId: "app-id",
-        qqAppSecret: "app-secret",
-        qqApiBase: "https://qq.example.test",
-        qqTokenUrl: "https://token.example.test",
-        llmUrl: "https://llm.example.test/chat/completions",
-        llmApiKey: "llm-key",
-        model: "test-model",
-        exaApiKey: "exa-key",
-        visionEnabled: true,
-        contextMessageLimit: 50,
-        messageRetentionLimit: 50,
-      });
-      let completionCount = 0;
-      agent.createModelClient = () => ({
-        complete: async () => {
-          completionCount += 1;
-          return completionCount === 1
-            ? {
-                message: {
-                  role: "assistant",
-                  content: null,
-                  toolCalls: [{
-                    id: "e2e-send-call",
-                    type: "function" as const,
-                    function: { name: "send_message", arguments: JSON.stringify({ action: "send", content: "webhook reply" }) },
-                  }],
-                },
-                usage: { totalTokens: 1 },
-              }
-            : { message: { role: "assistant", content: "done", toolCalls: [] }, usage: { totalTokens: 1 } };
-        },
-      });
-      const sendText = vi.fn(async () => ({ outcome: "sent" as const, messageId: "e2e-qq-message" }));
-      agent.createToolRuntime = () => new MemoryToolRuntime(state.storage.sql, {
-        qqClient: { sendText },
-        transactionSync: <T>(closure: () => T) => closure(),
-      });
-
-      await agent.flushPending();
-      const turnId = state.storage.sql.exec<{ id: string }>("SELECT id FROM turns LIMIT 1").toArray()[0]?.id;
-      if (!turnId) throw new Error("missing webhook-created turn");
-      await agent.runTurn({ turnId });
-      return {
-        sendCalls: sendText.mock.calls.length,
-        sendTarget: sendText.mock.calls[0]?.[0],
-        deliveries: state.storage.sql.exec("SELECT tool_call_id, status FROM outbound_deliveries").toArray(),
-        messages: state.storage.sql.exec("SELECT direction, status, text FROM messages ORDER BY id").toArray(),
-      };
-    });
-
-    expect(observed.sendCalls).toBe(1);
-    expect(observed.sendTarget).toMatchObject({
-      scope: "group",
-      targetId: "group-openid-1",
-      replyTo: "message-e2e-group-event",
-      quoteTo: "REFIDX-e2e-group-event==",
-    });
-    expect(observed.deliveries).toEqual([{ tool_call_id: "e2e-send-call", status: "sent" }]);
-    expect(observed.messages).toEqual([
-      { direction: "inbound", status: "visible", text: "hello" },
-      { direction: "outbound", status: "visible", text: "webhook reply" },
-    ]);
-    expect((await sendWebhook(groupPayload("e2e-group-event"))).status).toBe(200);
-    const deliveriesAfterDuplicate = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.sql.exec("SELECT tool_call_id, status FROM outbound_deliveries").toArray(),
-    );
-    expect(deliveriesAfterDuplicate).toEqual([{ tool_call_id: "e2e-send-call", status: "sent" }]);
-  });
-
-  it("runs a webhook-created C2C message through batching and one durable delivery", async () => {
-    expect((await sendWebhook(c2cPayload("e2e-c2c-event"))).status).toBe(200);
-    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-    const stub = namespace.get(namespace.idFromName("qq:c2c:user-openid-1"));
-    const observed = await runInDurableObject(stub, async (instance, state) => {
-      const agent = instance as unknown as {
-        schedule(...args: unknown[]): Promise<unknown>;
-        flushPending(): Promise<void>;
-        runTurn(payload: { turnId: string }): Promise<void>;
-        getRuntimeConfig(): Record<string, unknown>;
-        createModelClient(config: unknown): unknown;
-        createToolRuntime(config?: unknown): MemoryToolRuntime;
-      };
-      agent.schedule = async () => undefined;
-      agent.getRuntimeConfig = () => ({
-        qqAppId: "app-id",
-        qqAppSecret: "app-secret",
-        qqApiBase: "https://qq.example.test",
-        qqTokenUrl: "https://token.example.test",
-        llmUrl: "https://llm.example.test/chat/completions",
-        llmApiKey: "llm-key",
-        model: "test-model",
-        exaApiKey: "exa-key",
-        visionEnabled: false,
-        contextMessageLimit: 50,
-        messageRetentionLimit: 50,
-      });
-      let completionCount = 0;
-      agent.createModelClient = () => ({
-        complete: async () => {
-          completionCount += 1;
-          return completionCount === 1
-            ? {
-                message: {
-                  role: "assistant",
-                  content: null,
-                  toolCalls: [{
-                    id: "e2e-c2c-send-call",
-                    type: "function" as const,
-                    function: { name: "send_message", arguments: JSON.stringify({ action: "send", content: "c2c reply" }) },
-                  }],
-                },
-                usage: { totalTokens: 1 },
-              }
-            : { message: { role: "assistant", content: "done", toolCalls: [] }, usage: { totalTokens: 1 } };
-        },
-      });
-      const sendText = vi.fn(async (target: { scope: string; targetId: string }) => ({
-        outcome: "sent" as const,
-        messageId: `${target.scope}-${target.targetId}-message`,
-      }));
-      agent.createToolRuntime = () => new MemoryToolRuntime(state.storage.sql, {
-        qqClient: { sendText },
-        transactionSync: <T>(closure: () => T) => closure(),
-      });
-
-      await agent.flushPending();
-      const turnId = state.storage.sql.exec<{ id: string }>("SELECT id FROM turns LIMIT 1").toArray()[0]?.id;
-      if (!turnId) throw new Error("missing webhook-created C2C turn");
-      await agent.runTurn({ turnId });
-      return {
-        sendCalls: sendText.mock.calls,
-        deliveries: state.storage.sql.exec("SELECT tool_call_id, status FROM outbound_deliveries").toArray(),
-        messages: state.storage.sql.exec("SELECT direction, status, text FROM messages ORDER BY id").toArray(),
-      };
-    });
-
-    expect(observed.sendCalls).toHaveLength(1);
-    expect(observed.sendCalls[0]?.[0]).toEqual({ scope: "c2c", targetId: "user-openid-1" });
-    expect(observed.deliveries).toEqual([{ tool_call_id: "e2e-c2c-send-call", status: "sent" }]);
-    expect(observed.messages).toEqual([
-      { direction: "inbound", status: "visible", text: "hello c2c" },
-      { direction: "outbound", status: "visible", text: "c2c reply" },
-    ]);
-    expect((await sendWebhook(c2cPayload("e2e-c2c-event"))).status).toBe(200);
-    const deliveriesAfterDuplicate = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.sql.exec("SELECT tool_call_id, status FROM outbound_deliveries").toArray(),
-    );
-    expect(deliveriesAfterDuplicate).toEqual([{ tool_call_id: "e2e-c2c-send-call", status: "sent" }]);
-  });
-
-  it("uses isolated group and C2C Agent names", async () => {
-    expect((await sendWebhook(groupPayload("group-event-1"))).status).toBe(200);
-    expect(
-      (
-        await sendWebhook({
-          id: "c2c-event-1",
-          op: 0,
-          t: "C2C_MESSAGE_CREATE",
-          d: {
-            id: "c2c-message-1",
-            content: "direct",
-            author: { user_openid: "user-openid-1" },
-          },
-        })
-      ).status,
-    ).toBe(200);
-
-    expect(await storedRows("qq:group:group-openid-1")).toHaveLength(1);
-    expect(await storedRows("qq:c2c:user-openid-1")).toHaveLength(1);
-  });
-
-  it("returns 401 for missing or invalid signatures", async () => {
-    const missing = await worker.fetch(
-      new Request("https://worker.test/webhooks/qq", {
-        method: "POST",
-        body: JSON.stringify(groupPayload()),
-      }),
-      workerEnv,
-    );
-    expect(missing.status).toBe(401);
-    expect((await sendWebhook(groupPayload("bad-signature"), { signature: "bad" })).status).toBe(401);
-  });
-
-  it("ACKs valid unsupported events without calling the Agent", async () => {
-    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-    const before = (await listDurableObjectIds(namespace)).map((id) => id.toString()).sort();
-    const response = await sendWebhook({ id: "ready-event", op: 0, t: "READY", d: {} });
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ op: 12, d: 0 });
-    const after = (await listDurableObjectIds(namespace)).map((id) => id.toString()).sort();
-    expect(after).toEqual(before);
-  });
-
-  it("returns 400 for empty, malformed, or structurally invalid payloads", async () => {
-    const empty = await worker.fetch(
-      new Request("https://worker.test/webhooks/qq", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: "",
-      }),
-      workerEnv,
-    );
-    expect(empty.status).toBe(400);
-
-    const malformed = await worker.fetch(
-      new Request("https://worker.test/webhooks/qq", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: "{",
-      }),
-      workerEnv,
-    );
-    expect(malformed.status).toBe(400);
-
-    const invalidObject = await sendWebhook({ op: 0, t: "MESSAGE_CREATE", d: null });
-    expect(invalidObject.status).toBe(400);
-
-    const invalidArray = await sendWebhook({ op: 0, t: "MESSAGE_CREATE", d: [] });
-    expect(invalidArray.status).toBe(400);
-  });
-
-  it("rolls back a newly inserted event when scheduling fails so a retry can schedule it", async () => {
-    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-    const stub = namespace.get(namespace.idFromName("qq:group:schedule-retry-group"));
-    const outcome = await runInDurableObject(stub, async (instance, state) => {
-      const agent = instance as unknown as {
-        receiveMessage(message: ChatMessage): Promise<{ accepted: true; duplicate: boolean }>;
-        schedule(...args: unknown[]): Promise<unknown>;
-      };
-      const scheduleCalls: unknown[][] = [];
-      const originalSchedule = agent.schedule.bind(instance);
-      agent.schedule = async (...args: unknown[]) => {
-        scheduleCalls.push(args);
-        if (scheduleCalls.length === 1) throw new Error("scheduler unavailable");
-        return originalSchedule(...args);
-      };
-      const message = normalizedGroupMessage("schedule-retry-event");
-
-      await expect(agent.receiveMessage(message)).rejects.toThrow("scheduler unavailable");
-      const rowsAfterFailure = state.storage.sql
-        .exec<{ event_id: string }>("SELECT event_id FROM messages WHERE event_id = ?", message.eventId)
-        .toArray();
-      const retry = await agent.receiveMessage(message);
-      const rowsAfterRetry = state.storage.sql
-        .exec<{ event_id: string }>("SELECT event_id FROM messages WHERE event_id = ?", message.eventId)
-        .toArray();
-
-      return { retry, rowsAfterFailure, rowsAfterRetry, scheduleCalls };
-    });
-
-    expect(outcome.rowsAfterFailure).toEqual([]);
-    expect(outcome.retry).toEqual({ accepted: true, duplicate: false });
-    expect(outcome.rowsAfterRetry).toEqual([{ event_id: "schedule-retry-event" }]);
-    expect(outcome.scheduleCalls).toEqual([
-      [2, "flushPending", {}],
-      [2, "flushPending", {}],
-    ]);
-  });
-
-  it("returns 503 when Agent persistence fails", async () => {
-    const failingNamespace = {
-      idFromName: () => ({}) as DurableObjectId,
-      get: () => ({ receiveMessage: async () => { throw new Error("persistence failed"); } }),
-    } as unknown as DurableObjectNamespace;
-    const failingEnv = { ...workerEnv, GROUP_CHAT_AGENT: failingNamespace } as Env;
-
-    expect((await sendWebhook(groupPayload("persistence-failure"), { env: failingEnv })).status).toBe(503);
-  });
-
-  it("initializes all durable runtime tables and indexes", async () => {
-    expect((await sendWebhook(groupPayload("schema-event"))).status).toBe(200);
-    const names = await runInDurableObject(
-      (env.GROUP_CHAT_AGENT as DurableObjectNamespace).get(
-        (env.GROUP_CHAT_AGENT as DurableObjectNamespace).idFromName("qq:group:group-openid-1"),
-      ),
-      (_agent, state) => state.storage.sql
-        .exec<{ type: string; name: string }>(
-          "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
-        )
-        .toArray(),
-    );
-
-    expect(names).toEqual(expect.arrayContaining([
-      { type: "table", name: "messages" },
-      { type: "table", name: "turns" },
-      { type: "table", name: "turn_messages" },
-      { type: "table", name: "tool_calls" },
-      { type: "table", name: "outbound_deliveries" },
-      { type: "table", name: "memories" },
-    ]));
-    expect(names.filter((entry) => entry.type === "index").length).toBeGreaterThanOrEqual(4);
-  });
+  expect((await sendWebhook(groupPayload('schedule-retry'))).status).toBe(503);
+  expect(await storedRows('qq:group:group-openid-1')).toEqual([{event_id:'schedule-retry',chat_id:'group-openid-1',chat_kind:'group',status:'pending'}]);
+  expect((await sendWebhook(groupPayload('schedule-retry'))).status).toBe(200);
+  const observed=await runInDurableObject(ns.get(ns.idFromName('qq:group:group-openid-1')),async(instance,state)=>({events:state.storage.sql.exec('SELECT event_id FROM qq_events').toArray(),messages:state.storage.sql.exec('SELECT event_id FROM qq_messages').toArray(),schedules:await(instance as GroupChatAgent).listSchedules()}));
+  expect(observed.events).toEqual([{event_id:'schedule-retry'}]);expect(observed.messages).toEqual([{event_id:'schedule-retry'}]);expect(observed.schedules.filter(schedule=>schedule.callback === 'flushPending')).toHaveLength(1);
+ });
+ it('returns 503 when Agent persistence fails',async()=>{
+  const failingNamespace={idFromName:()=>({}) as DurableObjectId,get:()=>({receiveMessage:async()=>{throw new Error('persistence failed');}})} as unknown as DurableObjectNamespace;
+  expect((await sendWebhook(groupPayload(),{env:{...workerEnv,GROUP_CHAT_AGENT:failingNamespace}})).status).toBe(503);
+ });
 });

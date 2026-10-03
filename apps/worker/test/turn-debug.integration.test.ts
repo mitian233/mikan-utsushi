@@ -1,243 +1,43 @@
-import { env, reset, runInDurableObject } from "cloudflare:test";
-import { afterEach, describe, expect, it } from "vitest";
-import type { ChatCompletionResult, ModelMessage, ModelToolCall } from "@mikan-utsushi/model-provider";
-import { GroupChatAgent } from "../src/agents/group-chat-agent";
-import { SCHEMA_STATEMENTS } from "../src/agents/schema";
+import { env,reset,runInDurableObject } from 'cloudflare:test';
+import { afterEach,expect,it } from 'vitest';
+import type { GroupChatAgent } from '../src/agents/group-chat-agent';
+import type { PiCompletionClient } from '@mikan-utsushi/model-provider';
+import type { Env,RuntimeConfig } from '../src/env';
+import { fixtureCall,fixtureCompletion,fixtureConfig,fixtureMessage } from './runtime-fixtures';
 
-type TestAgent = {
-  executeTurn(turnId: string): Promise<{ hasSent: boolean }>;
-  getRuntimeConfig(): Record<string, unknown>;
-  createModelClient(config: unknown): {
-    complete(input: { messages: ModelMessage[] }, signal: AbortSignal): Promise<ChatCompletionResult>;
-  };
-  createToolRuntime(config?: unknown): {
-    execute(call: ModelToolCall): Promise<{
-      content: string;
-      sentCount: number;
-      terminal?: boolean;
-      termination?: "sent" | "silent";
-    }>;
-  };
-};
-
-type DebugRow = {
-  turn_id: string;
-  attempt_count: number;
-  round: number;
-  event: string;
-  payload: string;
-};
-
-function toolCall(id: string, name: string, args: Record<string, unknown>): ModelToolCall {
-  return { id, type: "function", function: { name, arguments: JSON.stringify(args) } };
+type TestAgent=Omit<GroupChatAgent,never>&{env:Env;getRuntimeConfig():RuntimeConfig;createModelClient(config:RuntimeConfig):PiCompletionClient};
+afterEach(async()=>{await reset();});
+async function capture(enabled:boolean,fail=false){
+ const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+ return runInDurableObject(ns.get(ns.idFromName('qq:group:fixture')),async(instance,state)=>{
+  const agent=instance as TestAgent;let calls=0;
+  agent.env.TURN_DEBUG_ENABLED=String(enabled);
+  agent.schedule=async()=>({id:'controlled'} as never);agent.getRuntimeConfig=()=>({...fixtureConfig,turnDebugEnabled:enabled});
+  agent.createModelClient=()=>({complete:async()=>{
+   if(fail)throw new Error('PRIVATE-UPSTREAM-ERROR');
+   calls++;
+   return calls === 1 ? fixtureCompletion([fixtureCall('memory_write',{scope:'group',content:'PRIVATE-MEMORY-BODY'},'memory-call')]) : fixtureCompletion([fixtureCall('send_message',{action:'silent'},'silent-call')]);
+  }});
+  await agent.receiveMessage({...fixtureMessage('debug'),text:'PRIVATE-CHAT-BODY'});await agent.flushPending();await agent.runTurn({turnId:'1'});
+  return {rows:state.storage.sql.exec<{round:number;event:string;payload_json:string}>('SELECT round,event,payload_json FROM qq_turn_debug ORDER BY id').toArray(),audits:state.storage.sql.exec('SELECT arguments_meta_json,result_meta_json FROM qq_tool_audit').toArray()};
+ });
 }
-
-function completion(content: string | null, toolCalls: ModelToolCall[] = []): ChatCompletionResult {
-  return { message: { role: "assistant", content, toolCalls }, usage: { totalTokens: 1 } };
-}
-
-function baseConfig(turnDebugEnabled: boolean) {
-  return {
-    qqAppId: "app-id",
-    qqAppSecret: "app-secret",
-    qqApiBase: "https://qq.example.test",
-    qqTokenUrl: "https://token.example.test",
-    llmUrl: "https://llm.example.test/chat/completions",
-    llmApiKey: "llm-key",
-    model: "test-model",
-    exaApiKey: "exa-key",
-    visionEnabled: false,
-    contextMessageLimit: 50,
-    messageRetentionLimit: 50,
-    turnDebugEnabled,
-  };
-}
-
-afterEach(async () => {
-  await reset();
+it('keeps raw debug disabled while retaining only redacted tool audits',async()=>{
+ const {rows,audits}=await capture(false);
+ expect(rows).toEqual([]);expect(audits).toHaveLength(2);
+ expect(JSON.stringify(audits)).not.toContain('PRIVATE-MEMORY-BODY');expect(JSON.stringify(audits)).not.toContain('PRIVATE-CHAT-BODY');
 });
-
-async function runTurnWithDebug(
-  turnDebugEnabled: boolean,
-  replies: ChatCompletionResult[],
-): Promise<{ debug: DebugRow[] }> {
-  const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-  const stub = namespace.get(namespace.idFromName("qq:group:turn-debug-group"));
-
-  return runInDurableObject(stub, async (instance, state) => {
-    for (const statement of SCHEMA_STATEMENTS) state.storage.sql.exec(statement);
-    const agent = instance as unknown as TestAgent;
-    const turnId = "debug-turn-1";
-    state.storage.sql.exec(
-      `INSERT INTO turns (id, status, attempt_count, first_message_at, created_at)
-       VALUES (?, 'queued', 0, 1, 1)`,
-      turnId,
-    );
-    state.storage.sql.exec(
-      `INSERT INTO messages
-       (id, event_id, message_id, direction, chat_kind, chat_id, user_id, text, images_json, status, created_at, turn_id)
-       VALUES (1, 'debug-event-1', 'debug-message-1', 'inbound', 'group', 'turn-debug-group', 'member-1', 'hello', '[]', 'batched', 1, ?)`,
-      turnId,
-    );
-    state.storage.sql.exec("INSERT INTO turn_messages (turn_id, message_id, position) VALUES (?, 1, 0)", turnId);
-
-    agent.getRuntimeConfig = () => baseConfig(turnDebugEnabled);
-    let index = 0;
-    agent.createModelClient = () => ({
-      complete: async () => replies[Math.min(index++, replies.length - 1)] as ChatCompletionResult,
-    });
-    agent.createToolRuntime = () => ({
-      execute: async (call) => call.function.name === "send_message"
-        ? {
-            content: JSON.stringify({ outcome: "silent" }),
-            sentCount: 0,
-            terminal: true,
-            termination: "silent",
-          }
-        : { content: JSON.stringify({ ok: true }), sentCount: 0 },
-    });
-
-    await agent.executeTurn(turnId);
-    return {
-      debug: state.storage.sql
-        .exec<DebugRow>("SELECT turn_id, attempt_count, round, event, payload FROM turn_debug ORDER BY id")
-        .toArray(),
-    };
-  });
-}
-
-describe("turn debug capture", () => {
-  it("writes nothing when debug capture is disabled", async () => {
-    const { debug } = await runTurnWithDebug(false, [
-      completion(null, [toolCall("silent-call", "send_message", { action: "silent" })]),
-    ]);
-    expect(debug).toEqual([]);
-  });
-
-  it("records each model round request and raw response when enabled", async () => {
-    const { debug } = await runTurnWithDebug(true, [
-      completion(null, [toolCall("call-1", "memory_search", { query: "hello" })]),
-      completion(null, [toolCall("silent-call", "send_message", { action: "silent" })]),
-    ]);
-
-    const events = debug.map((row) => row.event);
-    expect(events).toEqual(["model_request", "model_response", "model_request", "model_response"]);
-    expect(debug.map((row) => row.round)).toEqual([1, 1, 2, 2]);
-
-    const firstResponse = debug.find((row) => row.round === 1 && row.event === "model_response");
-    expect(JSON.parse(firstResponse?.payload ?? "{}")).toMatchObject({
-      message: {
-        content: null,
-        toolCalls: [{ id: "call-1", function: { name: "memory_search", arguments: JSON.stringify({ query: "hello" }) } }],
-      },
-    });
-
-    const secondResponse = debug.find((row) => row.round === 2 && row.event === "model_response");
-    expect(JSON.parse(secondResponse?.payload ?? "{}")).toMatchObject({
-      message: {
-        content: null,
-        toolCalls: [{ id: "silent-call", function: { name: "send_message", arguments: JSON.stringify({ action: "silent" }) } }],
-      },
-    });
-  });
-
-  it("records the raw request messages including the system prompt", async () => {
-    const { debug } = await runTurnWithDebug(true, [
-      completion(null, [toolCall("silent-call", "send_message", { action: "silent" })]),
-    ]);
-    const request = debug.find((row) => row.event === "model_request");
-    const payload = JSON.parse(request?.payload ?? "{}") as { messages?: Array<{ role: string }>; tools?: unknown[] };
-    expect(payload.messages?.[0]?.role).toBe("system");
-    expect(payload.messages?.some((message) => message.role === "user")).toBe(true);
-    expect(Array.isArray(payload.tools)).toBe(true);
-  });
-
-  it("records the tool result of the previous round on the next request", async () => {
-    const { debug } = await runTurnWithDebug(true, [
-      completion(null, [toolCall("call-1", "memory_search", { query: "hello" })]),
-      completion(null, [toolCall("silent-call", "send_message", { action: "silent" })]),
-    ]);
-    const secondRequest = debug.find((row) => row.round === 2 && row.event === "model_request");
-    const payload = JSON.parse(secondRequest?.payload ?? "{}") as { messages?: Array<{ role: string; tool_call_id?: string }> };
-    expect(payload.messages?.some((message) => message.role === "tool" && message.tool_call_id === "call-1")).toBe(true);
-  });
-
-  it("records a turn error with its message", async () => {
-    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-    const stub = namespace.get(namespace.idFromName("qq:group:turn-debug-error"));
-
-    await runInDurableObject(stub, async (instance, state) => {
-      for (const statement of SCHEMA_STATEMENTS) state.storage.sql.exec(statement);
-      const agent = instance as unknown as TestAgent;
-      const turnId = "debug-error-turn";
-      state.storage.sql.exec(
-        `INSERT INTO turns (id, status, attempt_count, first_message_at, created_at)
-         VALUES (?, 'queued', 0, 1, 1)`,
-        turnId,
-      );
-      state.storage.sql.exec(
-        `INSERT INTO messages
-         (id, event_id, message_id, direction, chat_kind, chat_id, user_id, text, images_json, status, created_at, turn_id)
-         VALUES (1, 'debug-error-event', 'debug-error-message', 'inbound', 'group', 'turn-debug-error', 'member-1', 'boom', '[]', 'batched', 1, ?)`,
-        turnId,
-      );
-      state.storage.sql.exec("INSERT INTO turn_messages (turn_id, message_id, position) VALUES (?, 1, 0)", turnId);
-
-      agent.getRuntimeConfig = () => baseConfig(true);
-      agent.createModelClient = () => ({
-        complete: async () => {
-          throw new Error("model exploded");
-        },
-      });
-      agent.schedule = async () => undefined;
-
-      await (agent as unknown as { runTurn(payload: { turnId: string }): Promise<void> }).runTurn({ turnId });
-    });
-
-    const rows = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.sql
-        .exec<DebugRow>("SELECT turn_id, attempt_count, round, event, payload FROM turn_debug ORDER BY id")
-        .toArray(),
-    );
-    expect(rows.length).toBeGreaterThan(0);
-    expect(rows.every((row) => row.turn_id === "debug-error-turn")).toBe(true);
-    const errorRow = rows.find((row) => row.event === "turn_error");
-    expect(JSON.parse(errorRow?.payload ?? "{}")).toMatchObject({ message: "model exploded" });
-  });
-
-  it("still records the failing model request before the error", async () => {
-    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-    const stub = namespace.get(namespace.idFromName("qq:group:turn-debug-error-request"));
-
-    await runInDurableObject(stub, async (instance, state) => {
-      for (const statement of SCHEMA_STATEMENTS) state.storage.sql.exec(statement);
-      const agent = instance as unknown as TestAgent;
-      const turnId = "debug-error-request-turn";
-      state.storage.sql.exec(
-        `INSERT INTO turns (id, status, attempt_count, first_message_at, created_at)
-         VALUES (?, 'queued', 0, 1, 1)`,
-        turnId,
-      );
-      state.storage.sql.exec(
-        `INSERT INTO messages
-         (id, event_id, message_id, direction, chat_kind, chat_id, user_id, text, images_json, status, created_at, turn_id)
-         VALUES (1, 'debug-e2', 'debug-m2', 'inbound', 'group', 'turn-debug-error-request', 'member-1', 'boom', '[]', 'batched', 1, ?)`,
-        turnId,
-      );
-      state.storage.sql.exec("INSERT INTO turn_messages (turn_id, message_id, position) VALUES (?, 1, 0)", turnId);
-      agent.getRuntimeConfig = () => baseConfig(true);
-      agent.createModelClient = () => ({
-        complete: async () => {
-          throw new Error("model exploded");
-        },
-      });
-      agent.schedule = async () => undefined;
-      await (agent as unknown as { runTurn(payload: { turnId: string }): Promise<void> }).runTurn({ turnId });
-    });
-
-    const events = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.sql.exec<{ event: string }>("SELECT event FROM turn_debug ORDER BY id").toArray(),
-    );
-    expect(events.map((row) => row.event)).toEqual(["model_request", "turn_error"]);
-  });
+it('captures explicit raw requests, responses and the preceding tool result with durable round numbers',async()=>{
+ const {rows}=await capture(true);
+ expect(rows.map(row=>[row.event,row.round])).toEqual([['model_request',1],['model_response',1],['model_request',2],['model_response',2]]);
+ const first=JSON.parse(rows[0]!.payload_json),response=JSON.parse(rows[1]!.payload_json),second=JSON.parse(rows[2]!.payload_json);
+ expect(first.messages[0].role).toBe('system');expect(first.messages).toContainEqual({role:'user',content:'PRIVATE-CHAT-BODY'});
+ expect(response.message.toolCalls).toContainEqual(fixtureCall('memory_write',{scope:'group',content:'PRIVATE-MEMORY-BODY'},'memory-call'));
+ expect(second.messages).toContainEqual(expect.objectContaining({role:'tool',tool_call_id:'memory-call'}));
+});
+it('records the failing request and structured business error without persisting an upstream error body',async()=>{
+ const {rows}=await capture(true,true);
+ expect(rows.map(row=>row.event)).toEqual(['model_request','turn_error']);
+ expect(JSON.parse(rows[1]!.payload_json)).toEqual({code:'model_failed'});
+ expect(JSON.stringify(rows)).not.toContain('PRIVATE-UPSTREAM-ERROR');
 });

@@ -1,181 +1,52 @@
 import { env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
-import type { ChatCompletionResult, ModelMessage } from "@mikan-utsushi/model-provider";
+import type { ModelMessage, PiCompletionClient } from "@mikan-utsushi/model-provider";
 import { ExaSearchClient } from "@mikan-utsushi/web-tools";
-import { GroupChatAgent } from "../src/agents/group-chat-agent";
+import type { GroupChatAgent } from "../src/agents/group-chat-agent";
 import { MemoryToolRuntime } from "../src/agents/tool-runtime";
-import { SCHEMA_STATEMENTS } from "../src/agents/schema";
+import type { RuntimeConfig } from "../src/env";
+import type { ToolRuntime } from "../src/agents/runtime-types";
+import { fixtureConfig, fixtureMessage, fixtureCall, fixtureCompletion } from "./runtime-fixtures";
 
-type TestAgent = GroupChatAgent & {
-  getRuntimeConfig(): Record<string, unknown>;
-  createModelClient(config: unknown): { complete(input: { messages: ModelMessage[] }, signal: AbortSignal): Promise<ChatCompletionResult> };
-  createToolRuntime(config?: unknown): MemoryToolRuntime;
-  schedule(...args: unknown[]): Promise<unknown>;
-};
-
-function toolCall(id: string, name: string, args: Record<string, unknown>) {
-  return {
-    id,
-    type: "function" as const,
-    function: { name, arguments: JSON.stringify(args) },
-  };
-}
-
-function completion(toolCalls: ReturnType<typeof toolCall>[] = []): ChatCompletionResult {
-  return {
-    message: { role: "assistant", content: toolCalls.length > 0 ? null : "done", toolCalls },
-    usage: { totalTokens: 1 },
-  };
-}
-
-afterEach(async () => {
-  await reset();
-});
-
-describe("complete group and C2C conversation flows", () => {
-  it.each([
-    { kind: "group" as const, chatId: "flow-group", userId: "group-member", visionEnabled: true },
-    { kind: "c2c" as const, chatId: "flow-user", userId: "flow-user", visionEnabled: false },
-  ])("delivers only explicit sends for $kind and preserves identity", async ({ kind, chatId, userId, visionEnabled }) => {
-    const namespace = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
-    const observed = await runInDurableObject(
-      namespace.get(namespace.idFromName(`qq:${kind}:${chatId}`)),
-      async (instance, state) => {
-        for (const statement of SCHEMA_STATEMENTS) state.storage.sql.exec(statement);
-        await state.storage.put("conversation_identity", { chatKind: kind, chatId });
-        const turnId = `turn-${kind}`;
-        state.storage.sql.exec(
-          `INSERT INTO turns (id, status, attempt_count, first_message_at, created_at)
-           VALUES (?, 'queued', 0, 1, 1)`,
-          turnId,
-        );
-        state.storage.sql.exec(
-          `INSERT INTO messages
-           (id, event_id, message_id, direction, chat_kind, chat_id, user_id, text, images_json, status, created_at, turn_id)
-           VALUES (1, ?, ?, 'inbound', ?, ?, ?, 'hello', ?, 'batched', 1, ?)`,
-          `event-${kind}`,
-          `message-${kind}`,
-          kind,
-          chatId,
-          userId,
-          JSON.stringify([{ url: "https://image.example.test/cat.jpg" }]),
-          turnId,
-        );
-        state.storage.sql.exec(
-          "INSERT INTO turn_messages (turn_id, message_id, position) VALUES (?, 1, 0)",
-          turnId,
-        );
-
-        const modelInputs: ModelMessage[][] = [];
-        const sendTargets: Array<{ scope: string; targetId: string; content: string }> = [];
-        let completionCount = 0;
-        const agent = instance as unknown as TestAgent;
-        agent.schedule = async () => undefined;
-        agent.getRuntimeConfig = () => ({
-          qqAppId: "app-id",
-          qqAppSecret: "app-secret",
-          qqApiBase: "https://qq.example.test",
-          qqTokenUrl: "https://token.example.test",
-          llmUrl: "https://llm.example.test/chat/completions",
-          llmApiKey: "llm-key",
-          model: "test-model",
-          exaApiKey: "exa-key",
-          visionEnabled,
-          contextMessageLimit: 50,
-          messageRetentionLimit: 50,
-        });
-        agent.createModelClient = () => ({
-          complete: async (input) => {
-            modelInputs.push(structuredClone(input.messages));
-            completionCount += 1;
-            if (completionCount === 1) {
-              return completion([
-                toolCall("memory-call", "memory_search", { query: "hello", scope: "group" }),
-                toolCall("search-call", "search_web", { query: "current" }),
-                toolCall("read-call", "read_web", { url: "https://example.test/secret" }),
-              ]);
-            }
-            if (completionCount === 2) {
-              return completion([
-                toolCall("send-call-1", "send_message", { action: "send", content: "first" }),
-              ]);
-            }
-            throw new Error("unexpected extra model round");
-          },
-        });
-        agent.createToolRuntime = () => new MemoryToolRuntime(state.storage.sql, {
-          exaClient: new ExaSearchClient({
-            apiKey: "exa-key",
-            fetchFn: async () => Response.json({
-              results: [{ title: "Current", url: "https://example.test", highlights: ["answer"] }],
-            }),
-          }),
-          readWebFn: async () => ({
-            url: "https://example.test/secret",
-            contentType: "text/html",
-            text: `${"safe-content ".repeat(500)}UNPERSISTED-SECRET-MARKER`,
-            truncated: true,
-            trust: "untrusted_web_content" as const,
-          }),
-          qqClient: {
-            sendText: async (target, content) => {
-              sendTargets.push({ ...target, content });
-              return { outcome: "sent", messageId: `qq-${sendTargets.length}` };
-            },
-          },
-        });
-
-        await agent.runTurn({ turnId });
-        return {
-          modelInputs,
-          sendTargets,
-          turns: state.storage.sql.exec("SELECT status, has_sent FROM turns").toArray(),
-          messages: state.storage.sql.exec("SELECT direction, chat_kind, chat_id, text, status FROM messages ORDER BY id").toArray(),
-          deliveries: state.storage.sql.exec("SELECT tool_call_id, status FROM outbound_deliveries ORDER BY created_at").toArray(),
-          toolCalls: state.storage.sql.exec("SELECT id, name, status, arguments_json, result_json FROM tool_calls ORDER BY created_at, id").toArray(),
-        };
-      },
-    );
-
-    expect(observed.sendTargets).toEqual([
-      { scope: kind, targetId: chatId, content: "first" },
-    ]);
-    expect(observed.deliveries).toEqual([
-      { tool_call_id: "send-call-1", status: "sent" },
-    ]);
-    expect(observed.toolCalls).toHaveLength(4);
-    expect(observed.toolCalls.every(({ id }: { id: string }) => /^sha256:[0-9a-f]{64}$/.test(id))).toBe(true);
-    expect(observed.toolCalls
-      .map(({ name, status }: { name: string; status: string }) => ({ name, status }))
-      .sort((left, right) => left.name.localeCompare(right.name))).toEqual([
-      { name: "memory_search", status: "completed" },
-      { name: "read_web", status: "completed" },
-      { name: "search_web", status: "completed" },
-      { name: "send_message", status: "completed" },
-    ]);
-    const readAudit = observed.toolCalls.find(({ name }: { name: string }) => name === "read_web") as { arguments_json: string; result_json: string };
-    expect(JSON.parse(readAudit.arguments_json)).toEqual({
-      tool: "read_web",
-      keys: ["url"],
-      valueLengths: { url: "https://example.test/secret".length },
-    });
-    expect(readAudit.result_json.length).toBeLessThan(2_000);
-    expect(readAudit.result_json).not.toContain("UNPERSISTED-SECRET-MARKER");
-    expect(observed.turns).toEqual([{ status: "completed", has_sent: 1 }]);
-    expect(observed.messages).toEqual([
-      { direction: "inbound", chat_kind: kind, chat_id: chatId, text: "hello", status: "visible" },
-      { direction: "outbound", chat_kind: kind, chat_id: chatId, text: "first", status: "visible" },
-    ]);
-
-    const initial = observed.modelInputs[0] ?? [];
-    const inbound = initial.find((message) => message.role === "user");
-    if (visionEnabled) {
-      expect(inbound).toMatchObject({ content: expect.arrayContaining([{ type: "image_url", image_url: { url: "https://image.example.test/cat.jpg" } }]) });
-    } else {
-      expect(JSON.stringify(inbound)).not.toContain("image_url");
-    }
-    const followUp = observed.modelInputs[1] ?? [];
-    expect(followUp).toContainEqual(expect.objectContaining({ role: "tool", tool_call_id: "memory-call" }));
-    expect(followUp).toContainEqual(expect.objectContaining({ role: "tool", tool_call_id: "search-call" }));
+type TestAgent=Omit<GroupChatAgent,never> & {getRuntimeConfig():RuntimeConfig;createModelClient(config:RuntimeConfig):PiCompletionClient;createToolRuntime(config?:RuntimeConfig):ToolRuntime};
+afterEach(async()=>{await reset();});
+describe("complete fresh group and C2C conversation flows",()=>{
+ it.each([{kind:'group' as const,visionEnabled:true},{kind:'c2c' as const,visionEnabled:false}])("executes tools, sends once, clears private execution, and isolates the next $kind context",async({kind,visionEnabled})=>{
+  const ns=env.GROUP_CHAT_AGENT as DurableObjectNamespace,chatId=`flow-${kind}`;
+  await runInDurableObject(ns.get(ns.idFromName(`qq:${kind}:${chatId}`)),async(instance,state)=>{
+   const agent=instance as TestAgent,sql=state.storage.sql;
+   const inputs:ModelMessage[][]=[],targets:unknown[]=[];
+   let requests=0;
+   agent.schedule=async()=>({id:'controlled-schedule'} as never);
+   agent.getRuntimeConfig=()=>({...fixtureConfig,visionEnabled});
+   agent.createModelClient=()=>({complete:async input=>{
+    inputs.push(structuredClone(input.messages));requests++;
+    if(requests === 1)return fixtureCompletion([fixtureCall('memory_search',{scope:'group',query:'hello'}),fixtureCall('search_web',{query:'current'}),fixtureCall('read_web',{url:'https://example.test/source'})]);
+    if(requests === 2)return fixtureCompletion([fixtureCall('send_message',{action:'send',content:'actual reply'})]);
+    return fixtureCompletion([fixtureCall('send_message',{action:'silent'},'finish-next')]);
+   }});
+   agent.createToolRuntime=()=>new MemoryToolRuntime(sql,{transactionSync:fn=>state.storage.transactionSync(fn),exaClient:new ExaSearchClient({apiKey:'synthetic-exa',fetchFn:async()=>Response.json({results:[{title:'Current',url:'https://example.test',highlights:['answer']}]})}),readWebFn:async()=>({url:'https://example.test/source',contentType:'text/html',text:'PRIVATE-EXECUTION-MARKER',truncated:false,trust:'untrusted_web_content'}),qqClient:{sendText:async(target,content)=>{targets.push({...target,content});return {outcome:'sent',messageId:'confirmed-platform-id'};}}});
+   const message={...fixtureMessage('hello',kind,chatId),images:[{url:'https://image.example.test/cat.jpg'}],requiresReply:kind === 'group',quoteReferenceId:kind === 'group' ? 'REFIDX-platform' : undefined};
+   await agent.receiveMessage(message);await agent.flushPending();await agent.runTurn({turnId:'1'});
+   expect(targets).toEqual([{scope:kind,targetId:chatId,content:'actual reply',...(kind === 'group' ? {replyTo:message.messageId,quoteTo:'REFIDX-platform'} : {})}]);
+   expect(sql.exec('SELECT status,termination FROM qq_turns').toArray()).toEqual([{status:'completed',termination:'sent'}]);
+   expect(sql.exec('SELECT direction,text,status FROM qq_messages ORDER BY id').toArray()).toEqual([{direction:'inbound',text:'hello',status:'visible'},{direction:'outbound',text:'actual reply',status:'visible'}]);
+   expect(sql.exec('SELECT name,status FROM qq_tool_audit ORDER BY name').toArray()).toEqual([{name:'memory_search',status:'completed'},{name:'read_web',status:'completed'},{name:'search_web',status:'completed'},{name:'send_message',status:'completed'}]);
+   expect(JSON.stringify(sql.exec('SELECT * FROM qq_tool_audit').toArray())).not.toContain('PRIVATE-EXECUTION-MARKER');
+   expect(sql.exec('SELECT id FROM entries').toArray()).toEqual([]);
+   expect(sql.exec('SELECT id FROM tasks').toArray()).toEqual([]);
+   expect(sql.exec('SELECT id FROM submissions').toArray()).toEqual([]);
+   expect(sql.exec('SELECT input_snapshot_json FROM qq_attempts').toArray()).toEqual([{input_snapshot_json:null}]);
+   expect(JSON.stringify(inputs[0]).includes('image_url')).toBe(visionEnabled);
+   expect(inputs[1]).toContainEqual(expect.objectContaining({role:'tool',tool_call_id:'read_web',content:'{"url":"https://example.test/source","contentType":"text/html","text":"PRIVATE-EXECUTION-MARKER","truncated":false,"trust":"untrusted_web_content"}'}));
+   const nextId=sql.exec<{next_id:string}>('SELECT next_id FROM durable_metadata').toArray()[0]!.next_id;
+   await agent.receiveMessage(fixtureMessage('next chat',kind,chatId));await agent.flushPending();await agent.runTurn({turnId:'2'});
+   expect(targets).toHaveLength(1);
+   expect(inputs[2]).toContainEqual({role:'assistant',content:'actual reply'});
+   expect(JSON.stringify(inputs[2])).not.toContain('PRIVATE-EXECUTION-MARKER');
+   expect(inputs[2]!.some(message=>message.role === 'tool')).toBe(false);
+   expect(Number(sql.exec<{next_id:string}>('SELECT next_id FROM durable_metadata').toArray()[0]!.next_id)).toBeGreaterThan(Number(nextId));
+   expect(sql.exec('SELECT status,termination FROM qq_turns ORDER BY id').toArray()).toEqual([{status:'completed',termination:'sent'},{status:'completed',termination:'silent'}]);
   });
+ });
 });

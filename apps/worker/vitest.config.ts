@@ -16,4 +16,5 @@ function markdownAsText() {
 
 export default defineConfig({
   plugins: [markdownAsText(), cloudflareTest({ wrangler: { configPath: "./wrangler.jsonc" } })],
+  test: { maxWorkers: 1 },
 });

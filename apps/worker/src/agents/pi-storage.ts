@@ -1,5 +1,5 @@
 import type { SqliteDatabase, SqliteStatement, SqliteValue } from "@earendil-works/pi-durable/storage/sqlite";
-
+import { cleanupCodemodeAttempt } from "../codemode/store";
 /** Pi 0.99.2 executes each storage commit synchronously inside one DO transaction. */
 export class DurableSqliteDatabase implements SqliteDatabase {
   private closed = false;
@@ -78,6 +78,7 @@ export function cleanupExecution(storage:DurableObjectStorage,turnId:number,atte
     sql.exec("UPDATE qq_attempts SET input_snapshot_json=NULL WHERE turn_id=? AND attempt=? AND settled_at IS NOT NULL",turnId,attempt);
     sql.exec("UPDATE qq_effect_receipts SET result_json=NULL WHERE turn_id=? AND attempt=?",turnId,attempt);
     sql.exec("UPDATE qq_deliveries SET content=NULL WHERE turn_id=?",turnId);
+    cleanupCodemodeAttempt(sql,turnId,attempt);
     const orphan=sql.exec(`SELECT id FROM record_ids WHERE
       (record_type='conversation' AND NOT EXISTS(SELECT 1 FROM conversations c WHERE c.id=record_ids.id)) OR
       (record_type='entry' AND NOT EXISTS(SELECT 1 FROM entries e WHERE e.id=record_ids.id)) OR

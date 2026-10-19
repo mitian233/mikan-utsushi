@@ -5,11 +5,12 @@ interface __BaseEnv_Env {
 	QQ_API_BASE: "https://api.sgroup.qq.com";
 	QQ_TOKEN_URL: "https://bots.qq.com/app/getAppAccessToken";
 	GROUP_CHAT_AGENT: DurableObjectNamespace<import("./src/index").GroupChatAgent>;
+	CODEMODE_SANDBOX: DurableObjectNamespace<import("../codemode-sandbox/src/index").CodemodeSandbox>;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
 		mainModule: typeof import("./src/index");
-		durableNamespaces: "GroupChatAgent";
+		durableNamespaces: "GroupChatAgent" | "CodemodeSandbox";
 	}
 	interface Env extends __BaseEnv_Env {}
 }

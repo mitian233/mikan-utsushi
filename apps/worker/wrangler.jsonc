@@ -10,6 +10,11 @@
         "name": "GROUP_CHAT_AGENT",
         "class_name": "GroupChatAgent",
       },
+      {
+        "name": "CODEMODE_SANDBOX",
+        "class_name": "CodemodeSandbox",
+        "script_name": "mikan-utsushi-codemode-sandbox",
+      },
     ],
   },
   "migrations": [

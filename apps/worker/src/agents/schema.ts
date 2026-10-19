@@ -177,6 +177,43 @@ CREATE TABLE IF NOT EXISTS qq_turn_debug (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS qq_debug_by_turn ON qq_turn_debug (turn_id, id);
+
+CREATE TABLE IF NOT EXISTS qq_codemode_executions (
+  execution_id TEXT PRIMARY KEY NOT NULL,
+  task_id INTEGER NOT NULL UNIQUE CHECK (task_id > 0),
+  turn_id INTEGER NOT NULL,
+  attempt INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'interrupted')),
+  summary TEXT CHECK (summary IS NULL OR (length(summary) <= 64 AND summary NOT GLOB '* *')),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (turn_id, attempt) REFERENCES qq_attempts(turn_id, attempt)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS qq_codemode_by_turn ON qq_codemode_executions (turn_id, execution_id);
+
+CREATE TABLE IF NOT EXISTS qq_codemode_calls (
+  execution_id TEXT NOT NULL REFERENCES qq_codemode_executions(execution_id),
+  ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+  namespace TEXT NOT NULL,
+  name TEXT NOT NULL,
+  access TEXT NOT NULL CHECK (access IN ('read', 'write')),
+  status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'outcome_unknown')),
+  metadata_json TEXT CHECK (metadata_json IS NULL OR (json_valid(metadata_json) AND length(metadata_json) <= 200)),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (execution_id, ordinal)
+) STRICT;
+
+CREATE TRIGGER IF NOT EXISTS qq_codemode_call_terminal
+BEFORE UPDATE OF status ON qq_codemode_calls
+WHEN OLD.status IN ('outcome_unknown', 'completed', 'failed')
+  AND NEW.status IS NOT OLD.status
+BEGIN
+  SELECT RAISE(ABORT, 'terminal codemode call cannot change');
+END;
+
+CREATE INDEX IF NOT EXISTS qq_codemode_writes ON qq_codemode_calls (execution_id, access, status);
 `];
 
 export function initializeSchema(storage: DurableObjectStorage, identity?: ConversationIdentity): void {

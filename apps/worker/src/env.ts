@@ -14,6 +14,8 @@ export interface Env {
   MODEL_MAX_ROUNDS?: string;
   TURN_DEBUG_ENABLED?: string;
   ADMIN_RETRY_SECRET?: string;
+  MCP_SERVERS?: string;
+  MCP_CREDENTIALS?: string;
 }
 
 export interface RuntimeConfig {

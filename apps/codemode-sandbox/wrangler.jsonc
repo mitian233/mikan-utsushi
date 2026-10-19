@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mikan-utsushi-codemode-sandbox",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-22",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CODEMODE_SANDBOX",
+        "class_name": "CodemodeSandbox",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["CodemodeSandbox"],
+    },
+  ],
+}

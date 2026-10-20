@@ -18,7 +18,7 @@ interface JsonRpcMessage {
   params?: { cursor?: string; name?: string; arguments?: { id?: string; title?: string } };
 }
 
-export type FixtureMode = "ok" | "unauthorized" | "too-many" | "server-error" | "empty-sse" | "huge-schema" | "redirect" | "endless-pages" | "too-many-tools" | "wide-catalog" | "tool-error" | "hang" | "huge-result";
+export type FixtureMode = "ok" | "unauthorized" | "too-many" | "server-error" | "empty-sse" | "huge-schema" | "redirect" | "endless-pages" | "too-many-tools" | "wide-catalog" | "tool-error" | "hang" | "huge-result" | "drop-write";
 
 export function createMcpFixture(endpoint: string, mode: FixtureMode = "ok"): {
   fetchFn: typeof fetch;
@@ -71,6 +71,14 @@ export function createMcpFixture(endpoint: string, mode: FixtureMode = "ok"): {
         return json({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "denied" }], isError: true } });
       }
       if (mode === "hang" && message.params?.name === "create_item") {
+        return new Promise((resolve) => {
+          const finish = (): void => resolve(new Response(null, { status: 499 }));
+          if (init?.signal?.aborted) finish();
+          else init?.signal?.addEventListener("abort", finish, { once: true });
+        });
+      }
+      if (mode === "drop-write" && message.params?.name === "create_item") {
+        callTool(items, () => `item-${++sequence}`, message.params);
         return new Promise((resolve) => {
           const finish = (): void => resolve(new Response(null, { status: 499 }));
           if (init?.signal?.aborted) finish();

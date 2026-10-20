@@ -3,8 +3,9 @@ import { ConversationConfig, GenerationTask, Harness, ToolTask, createRegistry, 
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { createPiModels, type PiCompletionClient, type ModelMessage } from "@mikan-utsushi/model-provider";
 import { DurableSqliteDatabase, cleanupExecution } from "./pi-storage";
-import { MEMORY_TOOL_DEFINITIONS, WEB_TOOL_DEFINITIONS, SEND_MESSAGE_TOOL_DEFINITION, hashAuditIdentifier, sanitizeAuditToolName, summarizeToolArguments, summarizeToolResult } from "./tool-runtime";
+import { MEMORY_TOOL_DEFINITIONS, WEB_TOOL_DEFINITIONS, SEND_MESSAGE_TOOL_DEFINITION, CODEMODE_TOOL_DEFINITION, hashAuditIdentifier, sanitizeAuditToolName, summarizeToolArguments, summarizeToolResult } from "./tool-runtime";
 import type { AttemptRow, ConversationIdentity, ToolRuntime, TurnExecutionResult } from "./runtime-types";
+import type { CodemodeRunner } from "../codemode/runtime";
 
 const AttemptLink = defineDocFamily<{conversationId:number},number>({kind:"app.qq-attempt-link",version:1,scope:"session",family:true,initial:conversationId=>({conversationId})});
 const definitions = [...MEMORY_TOOL_DEFINITIONS,...WEB_TOOL_DEFINITIONS,SEND_MESSAGE_TOOL_DEFINITION];
@@ -14,6 +15,7 @@ export interface PiRuntimeOptions {
   runtime: ToolRuntime;
   identity: ConversationIdentity;
   debugEnabled?: boolean;
+  codemode?: CodemodeRunner;
 }
 
 export class PiRuntime {
@@ -24,10 +26,14 @@ export class PiRuntime {
   private controller?: AbortController;
   private closed = false;
   private policyError?: string;
-  private constructor(private readonly storage:DurableObjectStorage,private readonly options:PiRuntimeOptions) {}
+  private readonly toolNames: string[];
+  private constructor(private readonly storage:DurableObjectStorage,private readonly options:PiRuntimeOptions) {
+    this.toolNames = (options.codemode ? [...definitions, CODEMODE_TOOL_DEFINITION] : definitions).map((tool) => tool.function.name);
+  }
 
   static async open(storage:DurableObjectStorage,options:PiRuntimeOptions):Promise<PiRuntime> {
     const host = new PiRuntime(storage,options),registry = createRegistry();
+    const exposed = options.codemode ? [...definitions, CODEMODE_TOOL_DEFINITION] : definitions;
     const models = createPiModels({model:options.model,client:{complete:(input,signal)=>{
       host.assertActive();
       return options.client.complete(input,AbortSignal.any([signal,host.controller!.signal]));
@@ -45,7 +51,7 @@ export class PiRuntime {
       onYield:()=>({continue:"Use tools to continue. Finish only with a single send_message(action=send|silent) call."}),
       afterResponse:async(message,api)=>{
         for (const [index,call] of message.content.entries()) {
-          if (call.type === "toolCall" && !definitions.some(definition=>definition.function.name === call.name)) {
+          if (call.type === "toolCall" && !exposed.some(definition=>definition.function.name === call.name)) {
             await host.auditRejectedCall(call,`${api.taskId}:${index}`);
           }
         }
@@ -64,9 +70,10 @@ export class PiRuntime {
       if (result.isError) await host.auditRejectedCall(call,String(api.taskId));
       return undefined;
     }});
-    for (const definition of definitions) registry.tools.add({name:definition.function.name,description:definition.function.description ?? "",
-      parameters:definition.function.parameters as ToolRegistration["parameters"],replay:"safe",executionMode:"sequential",
+    for (const definition of exposed) registry.tools.add({name:definition.function.name,description:definition.function.description ?? "",
+      parameters:definition.function.parameters as ToolRegistration["parameters"],replay:definition.function.name === "codemode" ? "unsafe" : "safe",executionMode:"sequential",
       execute:async(args,api,context)=>{
+        if (definition.function.name === "codemode") return host.executeCodemode(args,api,context);
         const attempt = host.assertActive();
         const call = {id:api.callId,type:"function" as const,function:{name:definition.function.name,arguments:JSON.stringify(args)}};
         const [turnHash,taskHash] = await Promise.all([hashAuditIdentifier(String(attempt.turn_id)),hashAuditIdentifier(String(api.taskId))]);
@@ -108,9 +115,39 @@ export class PiRuntime {
       turnHash,taskHash,name,summarizeToolArguments(name,JSON.stringify(call.arguments)),summarizeToolResult(name,JSON.stringify({error:"tool_rejected"})),now,now);
   }
 
+  private async executeCodemode(args: unknown, api: { callId: string; taskId: number }, context: { abortSignal?: AbortSignal }): Promise<{ content: Array<{ type: "text"; text: string }>; isError: boolean }> {
+    const runner = this.options.codemode;
+    if (!runner) throw new Error("Missing Code Mode runner");
+    const attempt = this.assertActive();
+    const code = args !== null && typeof args === "object" && "code" in args && typeof args.code === "string" ? args.code : "";
+    const encoded = JSON.stringify({ code });
+    const [turnHash, taskHash] = await Promise.all([hashAuditIdentifier(String(attempt.turn_id)), hashAuditIdentifier(String(api.taskId))]);
+    this.assertActive();
+    this.storage.sql.exec(`INSERT OR IGNORE INTO qq_tool_audit(turn_hash,task_hash,name,status,arguments_meta_json,created_at) VALUES(?,?,?,'running',?,?)`, turnHash, taskHash, "codemode", summarizeToolArguments("codemode", encoded), Date.now());
+    const result = await runner.execute(code, {
+      taskId: api.taskId,
+      context: {
+        turnId: String(attempt.turn_id),
+        attempt: attempt.attempt,
+        toolTaskId: api.taskId,
+        deadlineAt: attempt.deadline_at,
+        speakerId: attempt.speaker_id ?? undefined,
+        requiredReplyToMessageId: attempt.reply_to_message_id ?? undefined,
+        requiredQuoteReferenceId: attempt.quote_reference_id ?? undefined,
+        ...this.options.identity,
+        signal: AbortSignal.any([context.abortSignal ?? this.controller!.signal, this.controller!.signal]),
+      },
+    });
+    const content = JSON.stringify(result);
+    this.storage.sql.exec("UPDATE qq_tool_audit SET status=?,result_meta_json=?,completed_at=? WHERE turn_hash=? AND task_hash=?", result.ok ? "completed" : "failed", summarizeToolResult("codemode", content), Date.now(), turnHash, taskHash);
+    if (context.abortSignal?.aborted || this.controller?.signal.aborted) throw new Error("aborted");
+    return { content: [{ type: "text", text: content }], isError: !result.ok };
+  }
+
+
   private debug(event:"model_request"|"model_response",payload:unknown,round:number):void {
     if (!this.options.debugEnabled || !this.active) return;
-    this.storage.sql.exec("INSERT INTO qq_turn_debug(turn_id,attempt,round,event,payload_json,created_at) VALUES(?,?,?,?,?,?)",this.active.turn_id,this.active.attempt,round,event,JSON.stringify(payload),Date.now());
+    this.storage.sql.exec("INSERT INTO qq_turn_debug(turn_id,attempt,round,event,payload_json,created_at) VALUES(?,?,?,?,?,?)",this.active.turn_id,this.active.attempt,round,event,JSON.stringify(redactCodemodePayload(payload)),Date.now());
   }
 
   async runAttempt(attempt:AttemptRow):Promise<TurnExecutionResult> {
@@ -129,7 +166,7 @@ export class PiRuntime {
           const record=await tx.createConversation({ownership:{kind:"ownerless"}});
           await tx.doc(AttemptLink,key,record.id);
           const config=await tx.doc(ConversationConfig,record.id);
-          config.model={provider:"mikan",modelId:attempt.model};config.activeTools=definitions.map(tool=>tool.function.name);
+          config.model={provider:"mikan",modelId:attempt.model};config.activeTools=this.toolNames;
           config.toolExecution="sequential";config.retry={enabled:false,maxRetries:0,baseDelayMs:0};
           config.compaction={enabled:false,reserveTokens:0,keepRecentTokens:0,backgroundTokens:0};
           return record.id;
@@ -147,6 +184,7 @@ export class PiRuntime {
       const stored=await this.sqlite.submissionByRequest(this.conversationId,attempt.request_id,BACKGROUND_CONTEXT);
       const submission=stored ? await this.harness.submission(stored.id,BACKGROUND_CONTEXT) : await conversation.submit({type:"input",requestId:attempt.request_id,content:"Execute this QQ attempt."},BACKGROUND_CONTEXT);
       if (!submission) throw new Error("Missing Pi submission");
+      this.options.codemode?.recoverInterrupted();
       this.harness.resume();
       await awaitWithContext(submission.wait(BACKGROUND_CONTEXT),withAbortSignal(this.controller.signal,BACKGROUND_CONTEXT));
       await conversation.waitForIdle(BACKGROUND_CONTEXT);
@@ -164,6 +202,7 @@ export class PiRuntime {
   async close():Promise<void> {
     this.closed=true;
     await this.harness.close(BACKGROUND_CONTEXT);
+    await this.options.codemode?.close();
   }
 
   async cleanupAttempt(attempt:AttemptRow):Promise<void> {
@@ -180,4 +219,38 @@ export class PiRuntime {
     await this.close();
     cleanupExecution(this.storage,attempt.turn_id,attempt.attempt,id);
   }
+}
+
+function redactCodemodePayload(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactCodemodePayload);
+  if (typeof value !== "object" || value === null) return value;
+  const source = value as Record<string, unknown>;
+  const copy: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(source)) {
+    if (source.name === "codemode" && key === "arguments") {
+      const bytes = codeBytes(child);
+      copy.arguments = typeof child === "string" ? JSON.stringify({ bytes }) : { bytes };
+      continue;
+    }
+    copy[key] = redactCodemodePayload(child);
+  }
+  return copy;
+}
+
+function codeBytes(value: unknown): number {
+  return new TextEncoder().encode(codeText(value)).byteLength;
+}
+
+function codeText(value: unknown): string {
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (parsed !== null && typeof parsed === "object" && "code" in parsed && typeof parsed.code === "string") return parsed.code;
+    } catch {
+      return "";
+    }
+    return "";
+  }
+  if (value !== null && typeof value === "object" && "code" in value && typeof value.code === "string") return value.code;
+  return "";
 }

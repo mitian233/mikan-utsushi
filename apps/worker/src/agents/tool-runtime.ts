@@ -142,6 +142,20 @@ export const SEND_MESSAGE_TOOL_DEFINITION: ModelToolDefinition = {
   },
 };
 
+export const CODEMODE_TOOL_DEFINITION: ModelToolDefinition = {
+  type: "function",
+  function: {
+    name: "codemode",
+    description: "Run one JavaScript program against the exposed read tools and return its JSON result.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["code"],
+      properties: { code: { type: "string" } },
+    },
+  },
+};
+
 export const WEB_TOOL_DEFINITIONS: ModelToolDefinition[] = [
   {
     type: "function",
@@ -237,7 +251,7 @@ const CONVERSATION_SEARCH_MAX_LIMIT = 30;
 
 const AUDIT_TOOL_NAMES: Record<string,true> = {
   memory_search:true, memory_write:true, memory_update:true, memory_delete:true,
-  conversation_search:true, search_web:true, read_web:true, send_message:true,
+  conversation_search:true, search_web:true, read_web:true, send_message:true, codemode:true,
 };
 
 type AuditShape = Record<string, unknown>;
@@ -297,6 +311,10 @@ export function summarizeToolArguments(name: string, argumentsJson: string): str
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return boundedAuditText(JSON.stringify({ invalid_arguments: true }));
   }
+  if (auditName === "codemode") {
+    const code = typeof (value as AuditShape).code === "string" ? (value as { code: string }).code : "";
+    return boundedAuditText(JSON.stringify({ tool: auditName, bytes: new TextEncoder().encode(code).byteLength }));
+  }
   return boundedAuditText(JSON.stringify({ tool: auditName, ...argumentShape(auditName, value as AuditShape) }));
 }
 
@@ -351,6 +369,18 @@ export function summarizeToolResult(name: string, resultJson: string): string {
       type: "memory_delete_result",
       deleted: value.deleted === true,
       idLength: stringLength(value.id) ?? 0,
+    }));
+  }
+  if (auditName === "codemode" && typeof result === "object" && result !== null) {
+    const value = result as AuditShape;
+    const effects = typeof value.effects === "object" && value.effects !== null ? value.effects as AuditShape : {};
+    const count = (key: string): number => typeof effects[key] === "number" ? effects[key] as number : 0;
+    return boundedAuditText(JSON.stringify({
+      tool: auditName,
+      ok: value.ok === true,
+      completedWrites: count("completedWrites"),
+      unknownWrites: count("unknownWrites"),
+      failedWrites: count("failedWrites"),
     }));
   }
   if (auditName === "send_message" && typeof result === "object" && result !== null) {

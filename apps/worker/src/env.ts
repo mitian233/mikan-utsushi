@@ -1,6 +1,8 @@
+import type { CodemodeSandbox } from "../../codemode-sandbox/src/index.ts";
+
 export interface Env {
   GROUP_CHAT_AGENT: DurableObjectNamespace;
-  CODEMODE_SANDBOX: DurableObjectNamespace;
+  CODEMODE_SANDBOX: DurableObjectNamespace<CodemodeSandbox>;
   QQ_APP_ID: string;
   QQ_APP_SECRET: string;
   QQ_API_BASE?: string;

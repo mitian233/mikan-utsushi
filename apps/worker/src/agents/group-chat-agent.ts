@@ -3,6 +3,8 @@ import { OpenAICompatibleClient, type PiCompletionClient } from "@mikan-utsushi/
 import { QQBotClient } from "@mikan-utsushi/qqbot";
 import { Agent, type FiberRecoveryContext, type Schedule } from "agents";
 import { parseRuntimeConfig, type Env, type RuntimeConfig } from "../env";
+import { parseMcpConfiguration } from "../codemode/config";
+import { createCodemodeRuntime } from "../codemode/runtime";
 import { buildInitialModelMessages, type ContextMessage } from "./context";
 import { initializeSchema } from "./schema";
 import { PiRuntime } from "./pi-runtime";
@@ -220,7 +222,17 @@ export class GroupChatAgent extends Agent<Env,Record<string,never>> {
     if (this.host) return this.host;
     if (!this.hostOpening) {
       const config={...this.getRuntimeConfig(),model};
-      this.hostOpening=PiRuntime.open(this.ctx.storage,{model,client:this.createModelClient(config),runtime:this.createToolRuntime(config),identity:this.agentIdentity(),debugEnabled:config.turnDebugEnabled});
+      const runtime=this.createToolRuntime(config);
+      this.hostOpening=PiRuntime.open(this.ctx.storage,{model,client:this.createModelClient(config),runtime,identity:this.agentIdentity(),debugEnabled:config.turnDebugEnabled,codemode:createCodemodeRuntime({
+        storage:this.ctx.storage,
+        sandbox:()=>{
+          const namespace=this.env.CODEMODE_SANDBOX;
+          if (!namespace) throw new Error("Missing Code Mode sandbox binding");
+          return namespace.getByName(crypto.randomUUID());
+        },
+        localRuntime:runtime,
+        mcpConfiguration:()=>parseMcpConfiguration(this.env.MCP_SERVERS,this.env.MCP_CREDENTIALS),
+      })});
     }
     try {this.host=await this.hostOpening;return this.host;}
     finally {this.hostOpening=undefined;}

@@ -14,7 +14,7 @@
   "migrations": [
     {
       "tag": "v1",
-      "new_classes": ["CodemodeSandbox"],
+      "new_sqlite_classes": ["CodemodeSandbox"],
     },
   ],
 }

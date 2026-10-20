@@ -185,6 +185,32 @@ DELETE FROM qq_turn_debug;
 
 Cloudflare 控制台可回滚到上一个部署版本。注意 Durable Object SQLite 状态不会随代码回滚，历史消息、Memory、turn 与 delivery 记录保留。
 
+## 10. Code Mode 沙箱
+
+沙箱是另一个 Worker，必须先于宿主部署，宿主的 `CODEMODE_SANDBOX` binding 按脚本名 `mikan-utsushi-codemode-sandbox` 连接它。本次没有执行生产部署。沙箱的 `CodemodeSandbox` 通过 `new_sqlite_classes` 迁移创建；首次部署前不要沿用旧的 `new_classes` 声明，否则该 Durable Object 会落在 KV 存储后端。
+
+```bash
+pnpm --filter @mikan-utsushi/codemode-sandbox exec wrangler deploy
+pnpm --filter @mikan-utsushi/worker exec wrangler deploy
+```
+
+本地同时起两个进程。Wrangler 4.131 的 `dev --config` 只接受一个配置；跨 Worker Durable Object 靠本地 dev registry 连接，就绪后宿主日志应显示 `CODEMODE_SANDBOX` 为 `local [connected]`。
+
+```bash
+pnpm --filter @mikan-utsushi/codemode-sandbox exec wrangler dev --local --ip 127.0.0.1 --port 8797 --inspector-port 9232
+pnpm --filter @mikan-utsushi/worker exec wrangler dev --local --ip 127.0.0.1 --port 8795 --inspector-port 9231
+```
+
+`MCP_SERVERS` 是普通配置，`MCP_CREDENTIALS` 含请求头，使用 Wrangler Secret，不要写入仓库。下面是占位示例：
+
+```json
+MCP_SERVERS={"notes":{"url":"https://mcp.example.com/rpc","description":"Notes","tools":{"create_item":"write","get_item":"read","update_item":"write"}}}
+MCP_CREDENTIALS={"notes":{"headers":{"Authorization":"Bearer <token>"}}}
+```
+
+脚本里的名称是 `mcp__notes__create_item` 这种形式。服务端必须是不带 userinfo 的 `https` URL。沙箱 Worker 不配置业务 Secret；它的 HTTP 入口固定返回 404。
+
+
 ## 安全提醒
 
 - 不要提交 `.dev.vars`、任何 Secret 或真实凭据。

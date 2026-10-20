@@ -3,7 +3,7 @@ import type { JsonValue } from "@mikan-utsushi/contracts/codemode";
 import type { DestinationResolver } from "@mikan-utsushi/web-tools";
 import { normalizeCodemodeName, type ToolDescriptor, type ToolProvider } from "./catalog";
 import type { McpConfiguration } from "./config";
-import { createMcpFetch } from "./mcp-fetch";
+import { McpGuardError, createMcpFetch } from "./mcp-fetch";
 
 export interface McpExecutionContext {
   signal: AbortSignal;
@@ -38,16 +38,20 @@ function createProvider(
 ): ToolProvider {
   const namespace = `mcp__${normalizeCodemodeName(server)}`;
   let client: McpClient | undefined;
+  let opening: McpClient | undefined;
+  let connecting: Promise<McpClient> | undefined;
   let descriptors: readonly ToolDescriptor[] | undefined;
+  let discovering: Promise<readonly ToolDescriptor[]> | undefined;
+  let closing: Promise<void> | undefined;
+  let stopped = false;
   const allowed = new Map<string, "read" | "write">();
   for (const [name, access] of Object.entries(definition.tools)) {
     if (access === "read" || access === "write") allowed.set(name, access);
   }
 
-  async function connected(): Promise<McpClient> {
-    if (execution.signal.aborted) throw execution.signal.reason ?? new Error("MCP execution aborted");
+  async function openClient(): Promise<McpClient> {
+    if (execution.signal.aborted) throw new Error("MCP execution aborted");
     if (Date.now() > execution.deadlineAt) throw new Error("MCP deadline exceeded");
-    if (client) return client;
     const transport = new StreamableHttpTransport({
       url: definition.url,
       headers,
@@ -56,17 +60,44 @@ function createProvider(
       reconnect: { maxRetries: 0 },
     });
     const next = new McpClient({ name: "mikan-utsushi", version: "0.0.0" });
-    await next.connect(transport);
+    opening = next;
+    try {
+      await next.connect(transport);
+    } catch (error) {
+      if (opening === next) opening = undefined;
+      throw redacted(error);
+    }
+    if (stopped) {
+      await next.close();
+      throw new Error("MCP session is closed");
+    }
+    opening = undefined;
     client = next;
     return next;
   }
 
-  async function discover(signal: AbortSignal): Promise<readonly ToolDescriptor[]> {
-    if (descriptors) return descriptors;
-    const mcp = await connected();
+  function connected(): Promise<McpClient> {
+    if (stopped) return Promise.reject(new Error("MCP session is closed"));
+    if (client) return Promise.resolve(client);
+    if (connecting) return connecting;
+    const pending = openClient().then(
+      (opened) => opened,
+      (error: unknown) => {
+        if (connecting === pending) connecting = undefined;
+        throw error;
+      },
+    );
+    connecting = pending;
+    return pending;
+  }
+
+  async function load(signal: AbortSignal): Promise<readonly ToolDescriptor[]> {
+    if (signal.aborted) throw new Error("MCP execution aborted");
+    await connected();
     const found: ToolDescriptor[] = [];
     let cursor: string | undefined;
     for (let page = 0; page < PAGE_LIMIT; page += 1) {
+      if (signal.aborted) throw new Error("MCP execution aborted");
       const result = await request("tools/list", cursor === undefined ? {} : { cursor }, signal);
       const parsed = parseToolPage(result);
       for (const tool of parsed.tools) {
@@ -88,6 +119,21 @@ function createProvider(
     if (cursor !== undefined) throw new Error("catalog_limit");
     descriptors = found;
     return found;
+  }
+
+  function discover(signal: AbortSignal): Promise<readonly ToolDescriptor[]> {
+    if (descriptors) return Promise.resolve(descriptors);
+    if (signal.aborted) return Promise.reject(new Error("MCP execution aborted"));
+    if (discovering) return discovering;
+    const pending = load(signal).then(
+      (found) => found,
+      (error: unknown) => {
+        if (discovering === pending) discovering = undefined;
+        throw error;
+      },
+    );
+    discovering = pending;
+    return pending;
   }
 
   async function request(method: string, params: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
@@ -122,9 +168,23 @@ function createProvider(
         isError: result.isError === true,
       });
     },
-    close: async () => {
-      await client?.close();
-      client = undefined;
+    close: () => {
+      if (!closing) {
+        const current = client;
+        const pendingOpen = opening;
+        const inFlight = connecting;
+        stopped = true;
+        client = undefined;
+        opening = undefined;
+        connecting = undefined;
+        discovering = undefined;
+        closing = Promise.all([
+          current?.close() ?? Promise.resolve(),
+          pendingOpen?.close().catch(() => undefined) ?? Promise.resolve(),
+          inFlight?.then(() => undefined, () => undefined) ?? Promise.resolve(),
+        ]).then(() => undefined);
+      }
+      return closing;
     },
   };
 }
@@ -164,6 +224,7 @@ function assertSchemaSize(description: string, schema: Record<string, unknown> |
 }
 
 function redacted(error: unknown): Error {
+  if (error instanceof McpGuardError) return error;
   const status = typeof error === "object" && error !== null && "status" in error && typeof error.status === "number"
     ? error.status
     : undefined;

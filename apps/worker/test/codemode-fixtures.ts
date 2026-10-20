@@ -18,7 +18,7 @@ interface JsonRpcMessage {
   params?: { cursor?: string; name?: string; arguments?: { id?: string; title?: string } };
 }
 
-export type FixtureMode = "ok" | "unauthorized" | "too-many" | "server-error" | "empty-sse" | "huge-schema" | "redirect" | "endless-pages" | "too-many-tools" | "wide-catalog" | "tool-error" | "hang" | "huge-result" | "drop-write";
+export type FixtureMode = "ok" | "unauthorized" | "too-many" | "server-error" | "empty-sse" | "huge-schema" | "redirect" | "endless-pages" | "too-many-tools" | "wide-catalog" | "tool-error" | "rpc-error" | "hang" | "huge-result" | "drop-write" | "init-error" | "slow-init" | "hang-list";
 
 export function createMcpFixture(endpoint: string, mode: FixtureMode = "ok"): {
   fetchFn: typeof fetch;
@@ -31,8 +31,15 @@ export function createMcpFixture(endpoint: string, mode: FixtureMode = "ok"): {
   const requests: FixtureRequest[] = [];
   let sequence = 0;
   let toolCalls = 0;
+  let abortedLists = 0;
   let resolveCalled: () => void = () => undefined;
-  const called = new Promise<void>((resolve) => { resolveCalled = resolve; });
+  let resolveListed: () => void = () => undefined;
+  const called = new Promise<void>((resolve) => {
+    resolveCalled = resolve;
+  });
+  const listed = new Promise<void>((resolve) => {
+    resolveListed = resolve;
+  });
   const fetchFn: typeof fetch = async (input, init) => {
     const url = input instanceof Request ? input.url : input instanceof URL ? input.toString() : String(input);
     const method = init?.method ?? (input instanceof Request ? input.method : "GET");
@@ -45,8 +52,12 @@ export function createMcpFixture(endpoint: string, mode: FixtureMode = "ok"): {
     if (mode === "redirect" && message.method === "initialize") {
       return new Response(null, { status: 302, headers: { location: "https://evil.example/mcp" } });
     }
+    if (mode === "init-error" && message.method === "initialize") {
+      return new Response("secret-body-marker", { status: 500 });
+    }
     if (message.method === "notifications/initialized") return new Response(null, { status: 202 });
     if (message.method === "initialize") {
+      if (mode === "slow-init") await new Promise((resolve) => setTimeout(resolve, 50));
       return json({
         jsonrpc: "2.0",
         id: message.id,
@@ -59,6 +70,17 @@ export function createMcpFixture(endpoint: string, mode: FixtureMode = "ok"): {
     }
     if (headers.get("mcp-session-id") !== "fixture-session") return new Response("missing session", { status: 400 });
     if (message.method === "tools/list") {
+      if (mode === "hang-list") {
+        resolveListed();
+        return new Promise((resolve) => {
+          const finish = (): void => {
+            abortedLists += 1;
+            resolve(new Response(null, { status: 499 }));
+          };
+          if (init?.signal?.aborted) finish();
+          else init?.signal?.addEventListener("abort", finish, { once: true });
+        });
+      }
       return json({ jsonrpc: "2.0", id: message.id, result: listPage(mode, message.params?.cursor) });
     }
     if (message.method === "tools/call") {
@@ -69,6 +91,9 @@ export function createMcpFixture(endpoint: string, mode: FixtureMode = "ok"): {
       if (mode === "server-error") return new Response("secret-body-marker", { status: 500 });
       if (mode === "tool-error") {
         return json({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "denied" }], isError: true } });
+      }
+      if (mode === "rpc-error") {
+        return json({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "upstream said super-secret-token" } });
       }
       if (mode === "hang" && message.params?.name === "create_item") {
         return new Promise((resolve) => {
@@ -103,8 +128,12 @@ export function createMcpFixture(endpoint: string, mode: FixtureMode = "ok"): {
     items,
     requests,
     called,
+    listed,
     get toolCalls() {
       return toolCalls;
+    },
+    get abortedLists() {
+      return abortedLists;
     },
   };
 }

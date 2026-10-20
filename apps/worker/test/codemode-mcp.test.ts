@@ -153,3 +153,32 @@ it("closes the session on abort and does not start another tools call", async ()
   expect(fixture.requests.some((request) => request.method === "DELETE")).toBe(true);
 });
 
+it("hides an initialize error body and shares one session across concurrent calls", async () => {
+  const broken = createMcpFixture(endpoint, "init-error");
+  const [rejected] = createMcpProviders(configuration(), execution(), { fetchFn: broken.fetchFn });
+  await expect(rejected.list(signal)).rejects.toThrow(/MCP request failed/);
+  await expect(rejected.list(signal)).rejects.not.toThrow(/secret-body-marker/);
+  await rejected.close();
+  const slow = createMcpFixture(endpoint, "slow-init");
+  const [provider] = createMcpProviders(configuration(), execution(), { fetchFn: slow.fetchFn });
+  await Promise.all([provider.list(signal), provider.list(signal)]);
+  expect(slow.requests.filter((request) => request.body.includes("\"initialize\"")).length).toBe(1);
+  await provider.close();
+});
+
+it("redacts a remote JSON-RPC error message while keeping the local guard message", async () => {
+  const remote = createMcpFixture(endpoint, "rpc-error");
+  const [provider] = createMcpProviders(configuration(), execution(), { fetchFn: remote.fetchFn });
+  let message = "";
+  try {
+    await provider.call("create_item", { title: "Ada" }, signal);
+  } catch (error) {
+    message = error instanceof Error ? error.message : "";
+  }
+  expect(message).toBe("MCP request failed");
+  await provider.close();
+  const redirect = createMcpFixture(endpoint, "redirect");
+  const [guarded] = createMcpProviders(configuration(), execution(), { fetchFn: redirect.fetchFn });
+  await expect(guarded.list(signal)).rejects.toThrow(/MCP redirect/);
+  await guarded.close();
+});

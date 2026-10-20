@@ -109,11 +109,49 @@ Smoke 入口、配置、独立 SQLite、临时服务均已删除或停止；未�
 
 旧事件在群聊和 C2C 各重送一次，均返回 accepted=true / duplicate=true。没有为无检查点旧任务创建 Pi checkpoint，也未对未知 QQ 发送补发。本地结果证明同库覆盖启动、调度接续与迁移幂等性；不能证明生产数据规模、其他未知旧 schema 或真实平台服务行为。
 
+## QuickJS Code Mode 本地验收
+
+日期：2026-10-20。分支：`experiment/quickjs-do-codemode`。临时宿主只在被忽略的本地目录里调用生产 `createCodemodeRuntime`，沙箱是独立的 `mikan-utsushi-codemode-sandbox` Worker。Wrangler 4.131.2 本地 dev registry 把宿主的 `CODEMODE_SANDBOX` 显示为 `local [connected]`。MCP 是本机 HTTP 服务；宿主的测试 fetch 只把固定的 `https://example.com/codemode-mcp` 转到该服务，生产 URL 校验没有放宽。跑完后临时文件已删除。没有生产部署，也没有真实 QQ、LLM 或 Exa 调用。
+
+观察：
+
+| 场景 | 结果 |
+| --- | --- |
+| `return 1 + 2 + 3` | `ok`，值为 6 |
+| 脚本过滤记忆 | 只返回 `Ada Lovelace`，不返回 `other note` |
+| MCP create/update/get | `item-1`，标题 `Ada Lovelace`，version 2；两次写调用 completed |
+| 40,000 字符返回值 | `output_limit`，执行行 status `failed` |
+| `while (true) {}` | 1414ms 内结束，执行行 status `interrupted`，summary token `Execution` |
+| 五百万次 `Math.sqrt` 与宿主 probe | probe 时间 1792510835654，计算开始 1792510835649、结束 1792510837688；probe 在计算结束前返回 |
+| 丢弃 create 响应 | 远端留下 `item-2` / `once` / version 1；调用行 `outcome_unknown`，`unknownWrites` 为 1 |
+| 同一 `--persist-to` 重启宿主后再 create | `write_barrier`；条目仍是上述两个，没有第三个对象 |
+
+本地 workerd 不能证明 Cloudflare 生产或免费计划的 CPU、隔离和计费行为。
+
+### 修复后重跑（2026-10-21）
+
+代码评审修复了校验前移、会话关闭、裸名目录、`new_sqlite_classes` 迁移和 MCP 错误脱敏后，重跑同一双进程 smoke。宿主 `CODEMODE_SANDBOX` 仍为 `local [connected]`，MCP 是本机 `127.0.0.1:8799` 服务，宿主的测试 fetch 只把固定 `https://mcp.example.com/rpc` 转到该服务，生产 URL 校验与 `mcp-fetch.ts` 守卫未放宽。临时目录用后删除。
+
+| 场景 | 结果 |
+| --- | --- |
+| `return 1+2+3` | `ok`，`value` 为 6 |
+| `memory_search` 过滤 | 返回 `["Ada Lovelace"]` |
+| MCP create/update/get | `item-1`，标题 `Ada Lovelace`，version 2；`completedWrites` 为 2 |
+| 40,000 字符返回值 | `output_limit`，执行行 `failed` |
+| `while (true) {}` | `interrupted`，summary `Execution` |
+| 丢弃 create 响应 | 远端留下 `item-2`/`once`/version 1；调用行 `outcome_unknown`，`unknownWrites` 为 1 |
+| 丢响应后同 turn 再 create | `write_barrier`，`toolCalls` 仍为 4，远端无第三个对象 |
+| 同一 `--persist-to` 重启后再 create | 仍为 `write_barrier`，条目不变 |
+| 30,000,000 次 `Math.sqrt` 与宿主 probe | 计算 `1792515757220`→`1792515760271`；probe 在 `1792515757201`/`…414`/`…545` 返回，均在计算窗口内 |
+
+这次重跑直接验证了写屏障与会话生命周期的跨 Worker 行为；校验前移、`prepare` 失败不落未知写、`undefined` 返回值、无关 MCP server 不参与业务调用这几项由 Workers pool 集成测试覆盖（`test/codemode-runtime.integration.test.ts`、`test/codemode-mcp.test.ts`）。
+
 ## 部署与验证限制
 
 - 当前支持空库和迁移前主线旧业务 schema 的原位升级；本次只使用独立本地合成旧库，没有导入、清空或操作任何生产数据库。覆盖部署前提和配套数据恢复见 deployment.md。
 - 没有生产部署、登录、Wrangler Secret 写入或真实 QQ/LLM/Exa 调用。真实凭据、频控、回调注册和平台服务行为不由合成 smoke 证明。
 - Pi SDK 为 Experimental，固定版本的同步存储和清理实现不能直接套用后续版本；升级必须重新验证。
 - 显式 `TURN_DEBUG_ENABLED=true` 会保留原始敏感正文；它与默认审计分开，不参与可见聊天 retention，需要按部署排障流程手动关闭/清理。
+- Code Mode 的跨 Worker 证据来自 2026-10-20 的本地双进程 smoke，不是云端部署结果。未知写只保证同一 turn 不再次调用，不保证远端没有副作用，也不是 exactly-once。
 
 当前数据合同见 [数据库设计](superpowers/specs/2026-10-03-pi-durable-database-design.md)，完整实施状态见 [迁移计划](superpowers/plans/2026-10-03-pi-durable-runtime-migration.md)。

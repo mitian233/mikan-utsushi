@@ -198,3 +198,160 @@ it("does not call MCP after the deadline or the helper limit, and keeps a huge r
     await hugeRuntime.close();
   });
 });
+
+it("does not barrier a write that fails validation before MCP is called", async () => {
+  const ns = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+  await runInDurableObject(ns.get(ns.idFromName("qq:group:codemode-predispatch")), async (_instance, state) => {
+    const { context } = seedAttempt(state.storage);
+    const fixture = createMcpFixture(endpoint);
+    const runtime = createCodemodeRuntime({
+      storage: state.storage,
+      sandbox,
+      localRuntime: new MemoryToolRuntime(state.storage.sql, { transactionSync: (fn) => state.storage.transactionSync(fn) }),
+      mcpConfiguration: () => configuration(),
+      fetchFn: fixture.fetchFn,
+    });
+    const result = await runtime.execute(`
+      let blocked = false;
+      try { await tools.mcp__notes__create_item({}); }
+      catch (error) { blocked = String(error).includes("Invalid tool arguments"); }
+      const created = await tools.mcp__notes__create_item({ title: "Ada" });
+      return { blocked, id: created.structuredContent.id };
+    `, { taskId: 11, context });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value).toMatchObject({ blocked: true });
+    expect(fixture.toolCalls).toBe(1);
+    expect(fixture.items.size).toBe(1);
+    expect(state.storage.sql.exec("SELECT status FROM qq_codemode_calls WHERE access = 'write'").toArray()).toEqual([{ status: "completed" }]);
+    await runtime.close();
+  });
+});
+
+it("closes the MCP session when the script finishes and cancels discovery that outlives the script", async () => {
+  const ns = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+  await runInDurableObject(ns.get(ns.idFromName("qq:group:codemode-cleanup")), async (_instance, state) => {
+    const { context } = seedAttempt(state.storage);
+    const fixture = createMcpFixture(endpoint);
+    const runtime = createCodemodeRuntime({
+      storage: state.storage,
+      sandbox,
+      localRuntime: new MemoryToolRuntime(state.storage.sql),
+      mcpConfiguration: () => configuration(),
+      fetchFn: fixture.fetchFn,
+    });
+    const created = await runtime.execute("return await tools.mcp__notes__create_item({ title: \"Ada\" });", { taskId: 12, context });
+    expect(created.ok).toBe(true);
+    expect(fixture.requests.some((request) => request.method === "DELETE")).toBe(true);
+    const hanging = createMcpFixture(endpoint, "hang-list");
+    const hangingRuntime = createCodemodeRuntime({
+      storage: state.storage,
+      sandbox,
+      localRuntime: {
+        async execute() {
+          await hanging.listed;
+          return { content: "[]" };
+        },
+      },
+      mcpConfiguration: () => configuration(),
+      fetchFn: hanging.fetchFn,
+    });
+    const finished = await hangingRuntime.execute(`
+      searchTools("item");
+      await tools.memory_search({ query: "item", scope: "group" });
+      return 1;
+    `, { taskId: 13, context });
+    expect(finished).toMatchObject({ ok: true, value: 1 });
+    expect(hanging.abortedLists).toBeGreaterThan(0);
+    await runtime.close();
+    await hangingRuntime.close();
+  });
+});
+
+it("counts a failed discovery against the business call limit", async () => {
+  const ns = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+  await runInDurableObject(ns.get(ns.idFromName("qq:group:codemode-discovery-limit")), async (_instance, state) => {
+    const { context } = seedAttempt(state.storage);
+    const broken = createMcpFixture(endpoint, "huge-schema");
+    const runtime = createCodemodeRuntime({
+      storage: state.storage,
+      sandbox,
+      localRuntime: new MemoryToolRuntime(state.storage.sql),
+      mcpConfiguration: () => configuration(),
+      fetchFn: broken.fetchFn,
+    });
+    const result = await runtime.execute(`
+      let failures = 0;
+      for (let i = 0; i < 20; i++) {
+        try { await tools.mcp__notes__get_item({ id: "missing" }); }
+        catch (error) { if (String(error).includes("call_limit")) { failures = i; break; } }
+      }
+      return failures;
+    `, { taskId: 17, context });
+    expect(result).toMatchObject({ ok: true, value: 16 });
+    expect(broken.requests.filter((request) => request.body.includes("tools/list")).length).toBe(16);
+    await runtime.close();
+  });
+});
+
+it("does not discover an unrelated MCP server for a business call", async () => {
+  const ns = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+  await runInDurableObject(ns.get(ns.idFromName("qq:group:codemode-scoped")), async (_instance, state) => {
+    const { context } = seedAttempt(state.storage);
+    const notes = createMcpFixture(endpoint);
+    const broken = createMcpFixture("https://other.example.com/rpc", "server-error");
+    const config = parseMcpConfiguration(JSON.stringify({
+      notes: { url: endpoint, tools: { create_item: "write", get_item: "read" } },
+      other: { url: "https://other.example.com/rpc", tools: { hidden_tool: "read" } },
+    }));
+    const runtime = createCodemodeRuntime({
+      storage: state.storage,
+      sandbox,
+      localRuntime: new MemoryToolRuntime(state.storage.sql),
+      mcpConfiguration: () => config,
+      fetchFn: async (input, init) => {
+        const url = input instanceof Request ? input.url : String(input);
+        return url.startsWith("https://other.example.com") ? broken.fetchFn(input, init) : notes.fetchFn(input, init);
+      },
+    });
+    const result = await runtime.execute("return await tools.mcp__notes__get_item({ id: \"missing\" });", { taskId: 18, context });
+    expect(result.ok).toBe(true);
+    expect(broken.requests).toHaveLength(0);
+    await runtime.close();
+  });
+});
+
+it("returns a script with no value and discovers local tools by their callable names", async () => {
+  const ns = env.GROUP_CHAT_AGENT as DurableObjectNamespace;
+  await runInDurableObject(ns.get(ns.idFromName("qq:group:codemode-discovery")), async (_instance, state) => {
+    const { context } = seedAttempt(state.storage);
+    const runtime = createCodemodeRuntime({
+      storage: state.storage,
+      sandbox,
+      localRuntime: new MemoryToolRuntime(state.storage.sql),
+      mcpConfiguration: () => parseMcpConfiguration(),
+    });
+    const printed = await runtime.execute("text(\"done\");", { taskId: 14, context });
+    expect(printed.ok).toBe(true);
+    if (!printed.ok) return;
+    expect(printed.value).toBeUndefined();
+    expect(printed.output).toEqual(["done"]);
+    const described = await runtime.execute("return await describeTool(\"memory_search\");", { taskId: 15, context });
+    expect(described).toMatchObject({ ok: true, value: { name: "memory_search", namespace: "local", access: "read" } });
+    const fixture = createMcpFixture(endpoint);
+    const scoped = createCodemodeRuntime({
+      storage: state.storage,
+      sandbox,
+      localRuntime: new MemoryToolRuntime(state.storage.sql),
+      mcpConfiguration: () => configuration(),
+      fetchFn: fixture.fetchFn,
+    });
+    const found = await scoped.execute("return await searchTools(\"item\", { limit: 1, namespace: \"mcp__notes\" });", { taskId: 16, context });
+    expect(found.ok).toBe(true);
+    if (!found.ok || !Array.isArray(found.value)) return;
+    expect(found.value).toHaveLength(1);
+    expect(found.value[0]).toMatchObject({ namespace: "mcp__notes" });
+    await runtime.close();
+    await scoped.close();
+  });
+});

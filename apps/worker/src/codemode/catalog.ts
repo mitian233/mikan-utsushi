@@ -22,6 +22,7 @@ export interface ToolProvider {
   namespace: string;
   description?: string;
   list(signal: AbortSignal): Promise<readonly ToolDescriptor[]>;
+  nameStyle?: "qualified" | "bare";
   isAllowed(name: string, access: "read" | "write"): boolean;
   call(name: string, args: Record<string, JsonValue>, signal: AbortSignal): Promise<JsonValue>;
   close(): Promise<void>;
@@ -50,6 +51,7 @@ export interface ToolCatalog {
   describe(name: string, signal: AbortSignal): Promise<ToolDescription | undefined>;
   describeNamespace(namespace: string, signal: AbortSignal): Promise<NamespaceDescription | undefined>;
   call(name: string, args: Record<string, JsonValue>, signal: AbortSignal): Promise<JsonValue>;
+  prepare(name: string, args: Record<string, JsonValue>, signal: AbortSignal): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -93,7 +95,7 @@ export function createToolCatalog(providers: readonly ToolProvider[]): ToolCatal
       for (const descriptor of await provider.list(signal)) {
         if (descriptor.access !== "read" && descriptor.access !== "write") continue;
         const rawName = descriptor.name;
-        const fullName = `${provider.namespace}__${normalizeCodemodeName(rawName)}`;
+        const fullName = provider.nameStyle === "bare" ? normalizeCodemodeName(rawName) : `${provider.namespace}__${normalizeCodemodeName(rawName)}`;
         if (map.has(fullName)) throw new Error(`Tool name collision: ${fullName}`);
         const tool: RegisteredTool = {
           name: fullName,
@@ -127,6 +129,14 @@ export function createToolCatalog(providers: readonly ToolProvider[]): ToolCatal
     return tokens.every((token) => tool.name.includes(token)) ? 0 : 1;
   }
 
+  async function admit(name: string, args: Record<string, JsonValue>, signal: AbortSignal): Promise<RegisteredTool> {
+    const tool = (await tools(signal)).get(name);
+    if (!tool) throw new Error("Unknown Code Mode tool");
+    if (!tool.provider.isAllowed(tool.rawName, tool.access)) throw new Error("Tool is not allowed");
+    assertArguments(tool.inputSchema, args);
+    return tool;
+  }
+
   return {
     async search(query, options, signal) {
       const limit = Math.min(SEARCH_MAX_LIMIT, Math.max(1, options.limit ?? SEARCH_DEFAULT_LIMIT));
@@ -157,11 +167,11 @@ export function createToolCatalog(providers: readonly ToolProvider[]): ToolCatal
         })),
       };
     },
+    async prepare(name, args, signal) {
+      await admit(name, args, signal);
+    },
     async call(name, args, signal) {
-      const tool = (await tools(signal)).get(name);
-      if (!tool) throw new Error("Unknown Code Mode tool");
-      if (!tool.provider.isAllowed(tool.rawName, tool.access)) throw new Error("Tool is not allowed");
-      assertArguments(tool.inputSchema, args);
+      const tool = await admit(name, args, signal);
       return tool.provider.call(tool.rawName, args, signal);
     },
     async close() {
